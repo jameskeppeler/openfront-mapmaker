@@ -806,8 +806,8 @@
                 attribution: '© OpenStreetMap contributors'
             });
 
-            // Default to the topographic basemap
-            topo.addTo(map);
+            // Default to the OpenTopoMap basemap (contour lines + hillshade).
+            opentopo.addTo(map);
 
             // Layer control
             const baseMaps = {
