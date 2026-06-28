@@ -121,6 +121,23 @@ def generate_map():
         south, west, north, east = bounds['south'], bounds['west'], bounds['north'], bounds['east']
         if south >= north or west >= east:
             return jsonify({'error': 'Invalid bounds'}), 400
+
+        # Optional Advanced override: a custom terrain mix. If omitted, the map
+        # uses the region's natural elevation histogram. Percentages are
+        # normalized to fractions; mountains take the remainder.
+        plains_frac = highland_frac = None
+        terrain = data.get('terrain_mix')
+        if terrain:
+            try:
+                p = float(terrain.get('plains', 0))
+                h = float(terrain.get('highlands', 0))
+                m = float(terrain.get('mountains', 0))
+                total = p + h + m
+                if total > 0:
+                    plains_frac = p / total
+                    highland_frac = h / total
+            except (TypeError, ValueError):
+                plains_frac = highland_frac = None
         
         # Get API key - prefer user-provided, fallback to server config
         user_api_key = data.get('api_key', '')
@@ -148,7 +165,9 @@ def generate_map():
             east=east,
             width_px=width_px,
             height_px=height_px,
-            dem_source=dem_source
+            dem_source=dem_source,
+            plains_frac=plains_frac,
+            highland_frac=highland_frac,
         )
         
         # Auto-install into the local OpenFront game (copy + register so it

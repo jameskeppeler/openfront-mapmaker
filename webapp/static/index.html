@@ -506,6 +506,33 @@
                             <option value="COP30">Copernicus 30m (High Detail)</option>
                         </select>
                     </div>
+
+                    <div class="form-group">
+                        <label class="form-label" style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                            <input type="checkbox" id="customTerrainToggle" onchange="toggleTerrainMix()" style="width:auto; cursor:pointer;">
+                            ⚙️ Advanced: custom terrain mix
+                        </label>
+                        <div id="terrainMixControls" class="hidden" style="margin-top:8px;">
+                            <p style="color:#64748b; font-size:0.75rem; margin:0 0 8px;">
+                                Off = the region's natural elevation. On = force these
+                                proportions (auto-normalized to 100%).
+                            </p>
+                            <div style="display:flex; gap:8px;">
+                                <div style="flex:1;">
+                                    <div class="bounds-label">Plains %</div>
+                                    <input type="number" id="plainsPct" class="form-select" value="25" min="0" max="100" oninput="updateMountainPct()">
+                                </div>
+                                <div style="flex:1;">
+                                    <div class="bounds-label">Highlands %</div>
+                                    <input type="number" id="highlandPct" class="form-select" value="65" min="0" max="100" oninput="updateMountainPct()">
+                                </div>
+                                <div style="flex:1;">
+                                    <div class="bounds-label">Mountains %</div>
+                                    <div class="bounds-value" id="mountainPct" style="text-align:center; padding-top:10px;">10</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                 </div>
                 
                 <div class="panel">
@@ -784,7 +811,7 @@
             map = L.map('map', {
                 zoomSnap: 0,
                 zoomDelta: 0.5,
-                wheelPxPerZoomLevel: 140,
+                wheelPxPerZoomLevel: 60,
                 maxZoom: 22,
             }).setView([35.0, 33.0], 5);
 
@@ -914,6 +941,17 @@
             const hasBounds = currentBounds !== null;
             document.getElementById('generateBtn').disabled = !(hasName && hasBounds);
         }
+
+        function toggleTerrainMix() {
+            const on = document.getElementById('customTerrainToggle').checked;
+            document.getElementById('terrainMixControls').classList.toggle('hidden', !on);
+        }
+
+        function updateMountainPct() {
+            const p = parseFloat(document.getElementById('plainsPct').value) || 0;
+            const h = parseFloat(document.getElementById('highlandPct').value) || 0;
+            document.getElementById('mountainPct').textContent = Math.max(0, Math.round(100 - p - h));
+        }
         
         function calculateResolution(bounds) {
             const MAX_PIXELS = 3000000; // 3 million pixels
@@ -984,20 +1022,30 @@
                 // Calculate resolution for this request
                 const resolution = calculateResolution(currentBounds);
 
+                const payload = {
+                    name: name,
+                    bounds: currentBounds,
+                    dem_source: demSource,
+                    api_key: userApiKey,
+                    width_px: resolution.width,
+                    height_px: resolution.height
+                };
+                // Advanced: only send a custom terrain mix when enabled;
+                // otherwise the backend uses the natural elevation histogram.
+                if (document.getElementById('customTerrainToggle')?.checked) {
+                    const p = parseFloat(document.getElementById('plainsPct').value) || 0;
+                    const h = parseFloat(document.getElementById('highlandPct').value) || 0;
+                    const m = Math.max(0, 100 - p - h);
+                    payload.terrain_mix = { plains: p, highlands: h, mountains: m };
+                }
+
                 const response = await fetch(`${CONFIG.API_URL}/api/generate`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                         'Authorization': `Bearer ${token}`
                     },
-                    body: JSON.stringify({
-                        name: name,
-                        bounds: currentBounds,
-                        dem_source: demSource,
-                        api_key: userApiKey,
-                        width_px: resolution.width,
-                        height_px: resolution.height
-                    })
+                    body: JSON.stringify(payload)
                 });
 
                 const data = await response.json();

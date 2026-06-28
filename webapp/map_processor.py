@@ -33,6 +33,19 @@ TYPE_WATER = 1
 OSM_MAX_AREA_DEG2 = 1.5
 # Below this size (deg^2), prefer the finer COP30 DEM over COP90.
 SMALL_AREA_COP30_DEG2 = 0.25
+# Aim for up to this many named nation spawns (with real coordinates).
+NATION_TARGET = 30
+# If fewer than this many in-area names are found, pull extra place names from a
+# wider surrounding area to use as a fallback name pool (additionalNations).
+NATION_MIN = 8
+# OSM place types, most-prominent first (used to rank/limit place spawns).
+OSM_PLACE_TYPES = ["city", "town", "village", "hamlet", "suburb", "borough"]
+
+# Target terrain mix (fractions of land), applied via quantile mapping so maps
+# get a consistent, gameplay-friendly balance while preserving relief order.
+# Mountains take the remainder (1 - plains - highlands).
+TERRAIN_PLAINS_FRAC = 0.25
+TERRAIN_HIGHLAND_FRAC = 0.65
 # Overpass API endpoints (tried in order).
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
@@ -94,7 +107,8 @@ class MapProcessor:
         os.makedirs(output_dir, exist_ok=True)
     
     def generate(self, name: str, south: float, west: float, north: float, east: float,
-                 width_px: int, height_px: int, dem_source: str = 'COP90') -> dict:
+                 width_px: int, height_px: int, dem_source: str = 'COP90',
+                 plains_frac: float = None, highland_frac: float = None) -> dict:
         """
         Generate a styled terrain map.
         
@@ -128,7 +142,10 @@ class MapProcessor:
         
         # Step 3: Apply color palette
         print("Applying color palette...")
-        styled_image = self._apply_palette(dem_array, dynamic_scale=True)
+        styled_image = self._apply_palette(
+            dem_array, dynamic_scale=True,
+            plains_frac=plains_frac, highland_frac=highland_frac,
+        )
         
         # Step 4: Overlay water features. Small/zoomed-in areas use detailed
         # OpenStreetMap data (real rivers/lakes); large areas use Natural Earth
@@ -147,19 +164,44 @@ class MapProcessor:
             styled_image = self._add_water_features(
                 styled_image, south, west, north, east, width_px, height_px
             )
-        
-        # Step 5: Get province/country points (re-enabled: uses Natural Earth
-        # admin-0 countries, falling back to admin-1 provinces/states for
-        # smaller regions, to auto-place nation spawns with flags).
-        print("Detecting nations (countries/provinces) for spawns...")
+
+        # Re-apply the terrain mix over the FINAL land (after rivers), so the
+        # plains/highlands/mountains proportions reflect the playable land.
+        styled_image = self._recolor_land(
+            styled_image, dem_array, plains_frac, highland_frac
+        )
+
+        # Step 5: Nation spawn points. Admin regions (Natural Earth countries /
+        # provinces) first; for small/zoomed-in areas a box may contain only 1-2
+        # admin regions, so supplement with OSM place names (towns, villages) at
+        # their real coordinates, and if still too few, pull a name pool from a
+        # wider surrounding area (used as additionalNations).
+        print("Detecting nations for spawns...")
+        extra_names = []
         try:
             points = self._get_province_points(
                 south, west, north, east, width_px, height_px
             )
-            print(f"Found {len(points)} nation spawn points")
         except Exception as e:
-            print(f"Warning: nation detection failed, continuing with none: {e}")
+            print(f"Warning: admin nation detection failed: {e}")
             points = []
+        if area_deg2 <= OSM_MAX_AREA_DEG2 and len(points) < NATION_TARGET:
+            try:
+                points += self._get_osm_place_points(
+                    south, west, north, east, width_px, height_px,
+                    NATION_TARGET - len(points), points,
+                )
+            except Exception as e:
+                print(f"Warning: OSM place spawns failed: {e}")
+            if len(points) < NATION_MIN:
+                try:
+                    extra_names = self._get_nearby_place_names(
+                        south, west, north, east, points,
+                        NATION_MIN - len(points) + 10,
+                    )
+                except Exception as e:
+                    print(f"Warning: nearby name pool failed: {e}")
+        print(f"Found {len(points)} named spawns (+{len(extra_names)} pool names)")
         
         # Step 6: Save outputs
         print("Saving outputs...")
@@ -191,7 +233,9 @@ class MapProcessor:
         
         # Step 7: Generate game files (bin files, manifest, thumbnail)
         print("Generating game files...")
-        game_files = self._generate_game_files(styled_image, base_name, points)
+        game_files = self._generate_game_files(
+            styled_image, base_name, points, extra_names
+        )
         
         # Clean up temp DEM file
         if os.path.exists(dem_path):
@@ -270,51 +314,108 @@ class MapProcessor:
             
             return data, transform_new, src.crs
     
-    def _apply_palette(self, dem_array: np.ndarray, dynamic_scale: bool = True) -> Image.Image:
-        """Apply the OpenFront color palette to DEM data."""
-        
-        height, width = dem_array.shape
-        
-        # Create RGBA image
-        rgba = np.zeros((height, width, 4), dtype=np.uint8)
-        rgba[:, :, 3] = 255  # Fully opaque
-        
-        # Get ramp values
-        ramp = DEM_COLOR_RAMP
-        
-        # Dynamic scaling if requested
-        if dynamic_scale:
-            max_elevation = np.nanmax(dem_array[dem_array > 0])
-            if max_elevation > 0 and max_elevation < 5000:
-                scale = max_elevation / 5000.0
-                ramp = []
-                for val, color, label in DEM_COLOR_RAMP:
-                    if val <= 0:
-                        ramp.append((val, color, label))
-                    else:
-                        ramp.append((val * scale, color, label))
-        
-        # Apply discrete color ramp
-        for i in range(len(ramp)):
-            threshold = ramp[i][0]
-            color = ramp[i][1]
-            
-            if i == 0:
-                # Water (everything <= 0)
-                mask = dem_array <= threshold
-            elif i == len(ramp) - 1:
-                # Last color (everything above previous threshold)
-                prev_threshold = ramp[i-1][0]
-                mask = dem_array > prev_threshold
+    # Land palette colours (the >0 ramp entries), ordered plains -> peak. Tier
+    # index ranges: plains 0..9, highlands 10..19, mountains 20..(K-1).
+    @property
+    def _land_colors(self):
+        return np.array(
+            [c for (v, c, _l) in DEM_COLOR_RAMP if v > 0], dtype=np.uint8
+        )
+
+    def _terrain_indices(self, vals, K, plains_frac, highland_frac):
+        """Map land elevations -> palette indices.
+
+        Natural mode (fracs None): linear min->max stretch (reflects the
+        region's real elevation histogram). Custom mode: quantile mapping to the
+        requested plains/highlands/mountains fractions, preserving relief order.
+        """
+        if plains_frac is not None and highland_frac is not None:
+            P = max(0.0, min(1.0, plains_frac))
+            H = max(0.0, min(1.0 - P, highland_frac))
+            M = max(1e-6, 1.0 - P - H)
+            n = vals.size
+            ranks = np.empty(n, dtype=np.int64)
+            ranks[np.argsort(vals, kind="stable")] = np.arange(n)
+            r = ranks / max(1, n - 1)
+            idx = np.empty(n, dtype=np.int32)
+            pl = r < P
+            hl = (r >= P) & (r < P + H)
+            mt = r >= P + H
+            if P > 0:
+                idx[pl] = np.round((r[pl] / P) * 9).astype(np.int32)
+            if H > 0:
+                idx[hl] = (10 + np.round(((r[hl] - P) / H) * 9)).astype(np.int32)
             else:
-                prev_threshold = ramp[i-1][0]
-                mask = (dem_array > prev_threshold) & (dem_array <= threshold)
-            
-            rgba[mask, 0] = color[0]  # R
-            rgba[mask, 1] = color[1]  # G
-            rgba[mask, 2] = color[2]  # B
-        
-        return Image.fromarray(rgba, 'RGBA')
+                idx[hl] = 10
+            idx[mt] = (
+                20 + np.round(((r[mt] - P - H) / M) * (K - 1 - 20))
+            ).astype(np.int32)
+            print(
+                f"Terrain mix (custom): {round(P*100)}% plains / "
+                f"{round(H*100)}% highlands / {round(M*100)}% mountains"
+            )
+        else:
+            lo = float(np.percentile(vals, 2))
+            hi = float(np.percentile(vals, 98))
+            if hi - lo < 1e-6:
+                hi = lo + 1.0
+            norm = np.clip((vals - lo) / (hi - lo), 0.0, 1.0)
+            idx = np.round(norm * (K - 1)).astype(np.int32)
+            print(
+                f"Terrain mix (natural): elevation {lo:.0f}m..{hi:.0f}m stretched"
+            )
+        return np.clip(idx, 0, K - 1)
+
+    def _apply_palette(self, dem_array: np.ndarray, dynamic_scale: bool = True,
+                       plains_frac: float = None,
+                       highland_frac: float = None) -> Image.Image:
+        """Initial colouring: DEM water (<=0) + land by terrain mix.
+
+        The terrain mix is re-applied later over the FINAL land (after rivers are
+        drawn) via _recolor_land, so percentages reflect the playable land.
+        """
+        height, width = dem_array.shape
+        rgba = np.zeros((height, width, 4), dtype=np.uint8)
+        rgba[:, :, 3] = 255
+
+        land = dem_array > 0
+        wc = DEM_COLOR_RAMP[0][1]
+        rgba[~land, 0], rgba[~land, 1], rgba[~land, 2] = wc[0], wc[1], wc[2]
+
+        if np.any(land):
+            land_colors = self._land_colors
+            vals = dem_array[land].astype(np.float32)
+            idx = self._terrain_indices(vals, len(land_colors), plains_frac, highland_frac)
+            cols = land_colors[idx]
+            rgba[land, 0] = cols[:, 0]
+            rgba[land, 1] = cols[:, 1]
+            rgba[land, 2] = cols[:, 2]
+
+        return Image.fromarray(rgba, "RGBA")
+
+    def _recolor_land(self, image: Image.Image, dem_array: np.ndarray,
+                      plains_frac: float, highland_frac: float) -> Image.Image:
+        """Re-apply the terrain mix over the FINAL land (non-water) pixels.
+
+        Rivers/lakes occupy the lowest ground, so applying the mix only after
+        water is placed makes custom percentages (e.g. 25/65/10) reflect the
+        actual playable land instead of being eaten into by rivers.
+        """
+        arr = np.array(image.convert("RGBA"))
+        b = arr[:, :, 2].astype(int)
+        a = arr[:, :, 3]
+        water = (a < 20) | (b == 106)
+        land = (~water) & (dem_array > 0)
+        if not np.any(land):
+            return image
+        land_colors = self._land_colors
+        vals = dem_array[land].astype(np.float32)
+        idx = self._terrain_indices(vals, len(land_colors), plains_frac, highland_frac)
+        cols = land_colors[idx]
+        arr[land, 0] = cols[:, 0]
+        arr[land, 1] = cols[:, 1]
+        arr[land, 2] = cols[:, 2]
+        return Image.fromarray(arr, "RGBA")
     
     def _overpass_query(self, query: str):
         """POST a query to Overpass with on-disk caching + endpoint fallback.
@@ -594,6 +695,111 @@ class MapProcessor:
             for line in geom.geoms:
                 self._draw_line_geometry(draw, line, world_to_pixel, color, width)
     
+    def _dominant_flag(self, points):
+        """Most common (non-placeholder) flag among points, else 'xx'."""
+        from collections import Counter
+
+        flags = [
+            p.get("flag")
+            for p in points
+            if p.get("flag") and p.get("flag") != "xx"
+        ]
+        if not flags:
+            return "xx"
+        return Counter(flags).most_common(1)[0][0]
+
+    def _osm_places(self, south, west, north, east):
+        """Query OSM place nodes (cities/towns/villages...) in a bbox.
+
+        Returns a list of {name, place, lat, lon, pop}, most-prominent first.
+        """
+        bbox = f"{south},{west},{north},{east}"
+        types = "|".join(OSM_PLACE_TYPES)
+        query = (
+            "[out:json][timeout:60];"
+            f'node["place"~"^({types})$"]({bbox});'
+            "out body;"
+        )
+        data = self._overpass_query(query)
+        if not data:
+            return []
+        rank = {t: i for i, t in enumerate(OSM_PLACE_TYPES)}
+        out = []
+        for el in data.get("elements", []):
+            tags = el.get("tags", {}) or {}
+            name = tags.get("name")
+            if not name or "lat" not in el or "lon" not in el:
+                continue
+            try:
+                pop = int(tags.get("population", "0") or "0")
+            except ValueError:
+                pop = 0
+            out.append({
+                "name": name,
+                "place": tags.get("place", "town"),
+                "lat": el["lat"],
+                "lon": el["lon"],
+                "pop": pop,
+            })
+        out.sort(key=lambda p: (rank.get(p["place"], 99), -p["pop"]))
+        return out
+
+    def _get_osm_place_points(self, south, west, north, east, width, height,
+                              need, existing):
+        """In-bbox OSM place names as nation spawns (with real coordinates).
+
+        Returns up to `need` points {name, flag, pixel_x, pixel_y}, skipping
+        names already present in `existing`.
+        """
+        flag = self._dominant_flag(existing)
+        used = {p.get("name", "").lower() for p in existing}
+        points = []
+        for pl in self._osm_places(south, west, north, east):
+            if len(points) >= need:
+                break
+            nm = pl["name"]
+            if nm.lower() in used:
+                continue
+            px = int((pl["lon"] - west) / (east - west) * width)
+            py = int((north - pl["lat"]) / (north - south) * height)
+            if px < 0 or px >= width or py < 0 or py >= height:
+                continue
+            used.add(nm.lower())
+            points.append(
+                {"name": nm, "flag": flag, "pixel_x": px, "pixel_y": py}
+            )
+        print(f"OSM places: added {len(points)} in-area named spawn(s)")
+        return points
+
+    def _get_nearby_place_names(self, south, west, north, east, existing, need):
+        """Place names from a wider surrounding area (name pool, no coordinates).
+
+        Tops up tiny regions that contain few labeled places. Returns a list of
+        {name, flag}.
+        """
+        flag = self._dominant_flag(existing)
+        used = {p.get("name", "").lower() for p in existing}
+        dh0, dw0 = (north - south), (east - west)
+        names = []
+        # Progressively wider rings, so even remote wilderness eventually picks
+        # up regional town names.
+        for mult in (1, 3, 8):
+            if len(names) >= need:
+                break
+            dh, dw = dh0 * mult, dw0 * mult
+            for pl in self._osm_places(
+                south - dh, west - dw, north + dh, east + dw
+            ):
+                if len(names) >= need:
+                    break
+                nm = pl["name"]
+                if nm.lower() in used:
+                    continue
+                used.add(nm.lower())
+                names.append({"name": nm, "flag": flag})
+        print(f"OSM nearby: added {len(names)} fallback name(s)")
+        return names
+
     def _get_province_points(self, south: float, west: float, north: float, east: float,
                              width: int, height: int, max_provinces: int = 20) -> list:
         """Get province/country center points."""
@@ -738,7 +944,7 @@ class MapProcessor:
     # Game File Generation (map.bin, map4x.bin, map16x.bin, manifest.json, thumbnail.webp)
     # =========================================================================
     
-    def _generate_game_files(self, styled_image: Image.Image, base_name: str, points: list) -> list:
+    def _generate_game_files(self, styled_image: Image.Image, base_name: str, points: list, extra_names: list = None) -> list:
         """
         Generate OpenFront game files from the styled image.
         
@@ -863,7 +1069,15 @@ class MapProcessor:
                 ]
             }
             manifest["nations"].append(nation)
-        
+
+        # Fallback name pool (no coordinates) for when a game needs more nations
+        # than the map defines - the game places these at random.
+        if extra_names:
+            manifest["additionalNations"] = [
+                {"name": n.get("name", "Unknown"), "flag": n.get("flag", "xx")}
+                for n in extra_names
+            ]
+
         with open(os.path.join(self.output_dir, "manifest.json"), "w") as f:
             json.dump(manifest, f, indent=2, sort_keys=True)
         generated_files.append("manifest.json")
