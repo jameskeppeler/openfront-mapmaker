@@ -28,6 +28,17 @@ MIN_LAKE_SIZE = 200
 TYPE_LAND = 0
 TYPE_WATER = 1
 
+# Use detailed OpenStreetMap water for selections up to this size (deg^2);
+# larger areas use Natural Earth (Overpass would be too heavy/slow).
+OSM_MAX_AREA_DEG2 = 1.5
+# Below this size (deg^2), prefer the finer COP30 DEM over COP90.
+SMALL_AREA_COP30_DEG2 = 0.25
+# Overpass API endpoints (tried in order).
+OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+]
+
 
 # OpenFront Color Palette (Discrete)
 DEM_COLOR_RAMP = [
@@ -99,7 +110,14 @@ class MapProcessor:
         print(f"Bounds: S={south}, W={west}, N={north}, E={east}")
         print(f"DEM Source: {dem_source}")
         print(f"Output size: {width_px} x {height_px} px (total: {width_px * height_px:,} px)")
-        
+
+        area_deg2 = abs((north - south) * (east - west))
+
+        # For small/zoomed-in areas, COP90 has too few samples; prefer COP30.
+        if dem_source == "COP90" and area_deg2 <= SMALL_AREA_COP30_DEG2:
+            print("Small area: switching DEM to COP30 for finer terrain detail")
+            dem_source = "COP30"
+
         # Step 1: Download DEM
         print("Downloading DEM...")
         dem_path = self._download_dem(south, west, north, east, dem_source)
@@ -112,11 +130,23 @@ class MapProcessor:
         print("Applying color palette...")
         styled_image = self._apply_palette(dem_array, dynamic_scale=True)
         
-        # Step 4: Download and overlay water features
+        # Step 4: Overlay water features. Small/zoomed-in areas use detailed
+        # OpenStreetMap data (real rivers/lakes); large areas use Natural Earth
+        # (Overpass would be too heavy). Fall back to NE if OSM yields nothing.
         print("Adding water features...")
-        styled_image = self._add_water_features(
-            styled_image, south, west, north, east, width_px, height_px
-        )
+        used_osm = False
+        if area_deg2 <= OSM_MAX_AREA_DEG2:
+            try:
+                drawn = self._add_osm_water(
+                    styled_image, south, west, north, east, width_px, height_px
+                )
+                used_osm = drawn > 0
+            except Exception as e:
+                print(f"OSM water failed, falling back to Natural Earth: {e}")
+        if not used_osm:
+            styled_image = self._add_water_features(
+                styled_image, south, west, north, east, width_px, height_px
+            )
         
         # Step 5: Get province/country points (re-enabled: uses Natural Earth
         # admin-0 countries, falling back to admin-1 provinces/states for
@@ -286,6 +316,125 @@ class MapProcessor:
         
         return Image.fromarray(rgba, 'RGBA')
     
+    def _overpass_query(self, query: str):
+        """POST a query to Overpass with on-disk caching + endpoint fallback.
+
+        Returns the parsed JSON dict, or None on failure.
+        """
+        import hashlib
+
+        cache_dir = os.path.join(self.cache_dir, "osm")
+        os.makedirs(cache_dir, exist_ok=True)
+        key = hashlib.md5(query.encode("utf-8")).hexdigest()
+        cache_file = os.path.join(cache_dir, key + ".json")
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+
+        headers = {"User-Agent": "OpenFrontMapGenerator/1.0 (local map tool)"}
+        for url in OVERPASS_ENDPOINTS:
+            try:
+                print(f"Querying Overpass: {url}")
+                resp = requests.post(
+                    url, data={"data": query}, headers=headers, timeout=90
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    try:
+                        with open(cache_file, "w", encoding="utf-8") as f:
+                            json.dump(data, f)
+                    except Exception:
+                        pass
+                    return data
+                print(f"Overpass {url} returned HTTP {resp.status_code}")
+            except Exception as e:
+                print(f"Overpass {url} failed: {e}")
+        return None
+
+    def _add_osm_water(self, image: Image.Image, south: float, west: float,
+                       north: float, east: float, width: int, height: int) -> int:
+        """Overlay real rivers/lakes from OpenStreetMap (Overpass) onto the image.
+
+        Returns the number of water features drawn (0 if none / on failure), so
+        the caller can fall back to Natural Earth.
+        """
+        from PIL import ImageDraw
+
+        water_color = (0, 0, 106)
+        bbox = f"{south},{west},{north},{east}"
+        query = (
+            "[out:json][timeout:60];"
+            "("
+            f'way["waterway"~"^(river|stream|canal|drain|ditch)$"]({bbox});'
+            f'way["natural"="water"]({bbox});'
+            f'relation["natural"="water"]({bbox});'
+            f'way["water"]({bbox});'
+            ");"
+            "out geom;"
+        )
+
+        data = self._overpass_query(query)
+        if not data:
+            return 0
+        elements = data.get("elements", [])
+        if not elements:
+            return 0
+
+        draw = ImageDraw.Draw(image)
+
+        def to_px(lon, lat):
+            px = int((lon - west) / (east - west) * width)
+            py = int((north - lat) / (north - south) * height)
+            return (px, py)
+
+        river_w = max(2, width // 400)
+        small_w = max(1, width // 900)
+
+        def draw_line(geom, w):
+            pts = [to_px(p["lon"], p["lat"]) for p in geom]
+            if len(pts) < 2:
+                return False
+            draw.line(pts, fill=water_color, width=w, joint="curve")
+            # Round caps at each vertex so sharp bends stay connected.
+            r = w // 2
+            if r:
+                for (x, y) in pts:
+                    draw.ellipse([x - r, y - r, x + r, y + r], fill=water_color)
+            return True
+
+        def draw_poly(geom):
+            pts = [to_px(p["lon"], p["lat"]) for p in geom]
+            if len(pts) < 3:
+                return False
+            draw.polygon(pts, fill=water_color)
+            return True
+
+        drawn = 0
+        for el in elements:
+            etype = el.get("type")
+            tags = el.get("tags", {}) or {}
+            if etype == "way":
+                geom = el.get("geometry")
+                if not geom:
+                    continue
+                if tags.get("waterway"):
+                    w = river_w if tags.get("waterway") == "river" else small_w
+                    if draw_line(geom, w):
+                        drawn += 1
+                elif draw_poly(geom):
+                    drawn += 1
+            elif etype == "relation":
+                for m in el.get("members", []):
+                    if m.get("role") == "outer" and m.get("geometry"):
+                        if draw_poly(m["geometry"]):
+                            drawn += 1
+
+        print(f"OSM water: drew {drawn} feature(s) from {len(elements)} element(s)")
+        return drawn
+
     def _add_water_features(self, image: Image.Image, south: float, west: float,
                             north: float, east: float, width: int, height: int) -> Image.Image:
         """Add rivers and lakes to the image."""
@@ -684,8 +833,10 @@ class MapProcessor:
         manifest = {
             "name": base_name,
             "map": {
-                "width": width,
-                "height": height,
+                # map.bin holds the L1 (half-scale) data, so the manifest
+                # dimensions must be the L1 dimensions, not the full image's.
+                "width": l1_w,
+                "height": l1_h,
                 "num_land_tiles": l1_land
             },
             "map4x": {

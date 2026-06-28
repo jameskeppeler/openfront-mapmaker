@@ -777,33 +777,50 @@
         
         // Map initialization
         function initMap() {
-            map = L.map('map').setView([35.0, 33.0], 5);
-            
+            // Smooth, continuous zoom: zoomSnap 0 removes level snapping so the
+            // wheel/trackpad glides; a larger wheelPxPerZoomLevel makes each notch
+            // gentler; maxZoom 22 (with per-layer maxNativeZoom below) allows
+            // overzoom without blank tiles.
+            map = L.map('map', {
+                zoomSnap: 0,
+                zoomDelta: 0.5,
+                wheelPxPerZoomLevel: 140,
+                maxZoom: 22,
+            }).setView([35.0, 33.0], 5);
+
             // Esri World Topo (topographic - shaded relief + labels, similar to Google Terrain)
             const topo = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}', {
                 attribution: 'Tiles © Esri',
-                maxZoom: 19
+                maxNativeZoom: 19,
+                maxZoom: 22
             });
 
             // OpenTopoMap (true topographic style with contour lines + hillshade)
             const opentopo = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
                 attribution: 'Map data: © OpenStreetMap contributors, SRTM | Style: © OpenTopoMap (CC-BY-SA)',
-                maxZoom: 17
+                maxNativeZoom: 17,
+                maxZoom: 22
             });
 
             // Esri World Imagery (Satellite)
             const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-                attribution: 'Tiles © Esri'
+                attribution: 'Tiles © Esri',
+                maxNativeZoom: 19,
+                maxZoom: 22
             });
 
             // Esri Labels overlay (for use over satellite)
             const labels = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', {
-                attribution: ''
+                attribution: '',
+                maxNativeZoom: 19,
+                maxZoom: 22
             });
 
             // OpenStreetMap
             const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                attribution: '© OpenStreetMap contributors'
+                attribution: '© OpenStreetMap contributors',
+                maxNativeZoom: 19,
+                maxZoom: 22
             });
 
             // Default to the OpenTopoMap basemap (contour lines + hillshade).
@@ -1009,17 +1026,44 @@
         }
         
         function showSuccess(data) {
-            document.getElementById('progressCard').innerHTML = `
-                <div class="success-icon">✓</div>
-                <p class="progress-text">Map Generated!</p>
-                <p class="progress-subtext" style="margin-bottom: 1.5rem;">Your terrain map is ready to download</p>
-                <a href="${CONFIG.API_URL}${data.download_url}" class="btn btn-primary" style="display: inline-block; text-decoration: none;">
-                    📥 Download ZIP
-                </a>
-                <button class="btn btn-secondary" style="margin-left: 0.5rem;" onclick="closeProgress()">
-                    Close
-                </button>
-            `;
+            const card = document.getElementById('progressCard');
+            const info = data.installed;
+            if (info) {
+                // Auto-installed straight into the local game.
+                card.innerHTML = `
+                    <div class="success-icon">✓</div>
+                    <p class="progress-text">Added to OpenFront!</p>
+                    <p class="progress-subtext" style="margin-bottom: 1.25rem;">
+                        &ldquo;<strong>${info.display_name}</strong>&rdquo; is now in the game under the
+                        <strong>Custom</strong> tab &mdash; the game tab refreshes itself.
+                    </p>
+                    <button class="btn btn-primary" onclick="window.open('http://localhost:9000','openfront')">
+                        ▶ Play in OpenFront
+                    </button>
+                    <button class="btn btn-secondary" style="margin-left: 0.5rem;" onclick="closeProgress()">
+                        Make another
+                    </button>
+                    <p class="progress-subtext" style="margin-top: 1rem; font-size: 0.8rem; opacity: 0.7;">
+                        <a href="${CONFIG.API_URL}${data.download_url}" style="color: inherit;">Download ZIP</a> (optional backup)
+                    </p>
+                `;
+            } else {
+                // Install was skipped or failed — fall back to manual download.
+                const msg = data.install_error
+                    ? `Generated, but couldn't auto-add to the game: ${data.install_error}`
+                    : 'Your terrain map is ready to download';
+                card.innerHTML = `
+                    <div class="success-icon">✓</div>
+                    <p class="progress-text">Map Generated!</p>
+                    <p class="progress-subtext" style="margin-bottom: 1.5rem;">${msg}</p>
+                    <a href="${CONFIG.API_URL}${data.download_url}" class="btn btn-primary" style="display: inline-block; text-decoration: none;">
+                        📥 Download ZIP
+                    </a>
+                    <button class="btn btn-secondary" style="margin-left: 0.5rem;" onclick="closeProgress()">
+                        Close
+                    </button>
+                `;
+            }
         }
         
         function showError(message) {

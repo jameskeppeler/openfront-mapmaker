@@ -20,6 +20,9 @@ load_dotenv()
 # Import our map generator
 from map_processor import MapProcessor
 
+# Import the auto-installer (drops finished maps straight into the local game)
+from install_to_game import install_map
+
 app = Flask(__name__, static_folder='static')
 CORS(app)  # Allow cross-origin requests from GitHub Pages
 
@@ -148,11 +151,23 @@ def generate_map():
             dem_source=dem_source
         )
         
+        # Auto-install into the local OpenFront game (copy + register so it
+        # shows in the in-game Custom tab). Non-fatal: if it fails, the user
+        # can still download the ZIP.
+        installed = None
+        install_error = None
+        try:
+            installed = install_map(map_dir, name)
+        except Exception as e:
+            install_error = str(e)
+
         return jsonify({
             'success': True,
             'map_id': map_id,
             'files': result['files'],
-            'download_url': f'/api/download/{map_id}'
+            'download_url': f'/api/download/{map_id}',
+            'installed': installed,
+            'install_error': install_error,
         })
         
     except Exception as e:
