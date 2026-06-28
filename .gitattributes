@@ -1,0 +1,4 @@
+# Shell launchers must keep LF line endings so they run on macOS/Linux
+# (a CRLF in the shebang line breaks them: "bad interpreter: /bin/bash^M").
+*.command text eol=lf
+*.sh      text eol=lf

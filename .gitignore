@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# API Key (contains sensitive data)
+apikey
+.env
+
+# VS Code
+.vscode/
