@@ -38,17 +38,20 @@ A complete workflow for generating stylised, game-ready terrain maps from real-w
 │   └── map_generator.py        # Python script for processing assets
 ├── StylisedMaps/               # Input folder for QGIS exports
 ├── generated/                  # Output folder for game assets
-└── requirements.txt            # Python dependencies
+├── pyproject.toml              # Python dependencies (uv)
+└── uv.lock                     # Locked dependency versions
 ```
 
 ## Prerequisites
 
 1.  **QGIS** (v3.40 or compatible).
-2.  **Python 3.x** installed.
-3.  Install required Python packages:
+2.  **[uv](https://docs.astral.sh/uv/)** installed (`brew install uv`, or
+    `curl -LsSf https://astral.sh/uv/install.sh | sh`). It manages Python and deps.
+3.  Install the standalone-script dependencies:
     ```bash
-    pip install -r requirements.txt
+    uv sync
     ```
+    Run the processor with `uv run python scripts/map_generator.py ...`.
 
 ## Configuration
 
@@ -110,6 +113,6 @@ The tool generates **two versions** of the map in `generated/maps/`.
 
 ## Troubleshooting
 
-*   **"ModuleNotFoundError"**: Run `pip install -r requirements.txt`.
+*   **"ModuleNotFoundError"**: Run `uv sync`, and launch the script with `uv run python scripts/map_generator.py ...`.
 *   **QGIS Path Errors**: Ensure you are running the script from a saved file, or manually update the `PROJECT_ROOT` variable in the Python script if running directly from the console buffer.
 

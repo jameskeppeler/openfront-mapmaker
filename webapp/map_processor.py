@@ -988,84 +988,79 @@ class MapProcessor:
             terrain_type, terrain_mag, terrain_shore, terrain_ocean
         )
         
-        # Create downscaled maps
-        # L1 (1/2)
+        # Build LOD minimaps from the full-res terrain (L0):
+        #   L1 (1/2) -> map4x.bin,  L2 (1/4) -> map16x.bin
         l1_type, l1_mag, l1_shore, l1_ocean = self._downscale_terrain(
             terrain_type, terrain_mag, terrain_shore, terrain_ocean
         )
-        
-        # L2 (1/4)
         l2_type, l2_mag, l2_shore, l2_ocean = self._downscale_terrain(
             l1_type, l1_mag, l1_shore, l1_ocean
         )
-        
-        # L3 (1/8)
-        l3_type, l3_mag, l3_shore, l3_ocean = self._downscale_terrain(
-            l2_type, l2_mag, l2_shore, l2_ocean
-        )
-        
-        # Pack data
+
+        # Pack data: L0 = full-res (map.bin), L1/L2 = LOD minimaps.
         l0_data, l0_land = self._pack_terrain(terrain_type, terrain_mag, terrain_shore, terrain_ocean)
         l1_data, l1_land = self._pack_terrain(l1_type, l1_mag, l1_shore, l1_ocean)
         l2_data, l2_land = self._pack_terrain(l2_type, l2_mag, l2_shore, l2_ocean)
-        l3_data, l3_land = self._pack_terrain(l3_type, l3_mag, l3_shore, l3_ocean)
         
-        # Save game files (use small version: L1, L2, L3)
+        # Save game files. map.bin holds the FULL-resolution (L0) terrain, with
+        # map4x/map16x as the 1/2 and 1/4 LOD minimaps - matching the official Go
+        # map-generator. (Previously this wrote L1/L2/L3, shipping a half-scale
+        # map and discarding the full-res L0 it had already computed.)
         generated_files = []
-        
+
         # Write binary files
         with open(os.path.join(self.output_dir, "map.bin"), "wb") as f:
-            f.write(l1_data)
+            f.write(l0_data)
         generated_files.append("map.bin")
-        
+
         with open(os.path.join(self.output_dir, "map4x.bin"), "wb") as f:
-            f.write(l2_data)
+            f.write(l1_data)
         generated_files.append("map4x.bin")
-        
+
         with open(os.path.join(self.output_dir, "map16x.bin"), "wb") as f:
-            f.write(l3_data)
+            f.write(l2_data)
         generated_files.append("map16x.bin")
-        
-        # Generate and save thumbnail
-        thumbnail = self._create_thumbnail(l2_type, l2_mag, l2_shore, 0.5)
+
+        # Generate and save thumbnail (from the 4x LOD = L1, like the Go pipeline)
+        thumbnail = self._create_thumbnail(l1_type, l1_mag, l1_shore, 0.5)
         thumbnail.save(os.path.join(self.output_dir, "thumbnail.webp"), "WEBP")
         generated_files.append("thumbnail.webp")
         
-        # Create manifest
+        # Create manifest. Dimensions must match the .bin LODs:
+        # map = L0 (full), map4x = L1 (1/2), map16x = L2 (1/4).
+        l0_h, l0_w = terrain_type.shape
         l1_h, l1_w = l1_type.shape
         l2_h, l2_w = l2_type.shape
-        l3_h, l3_w = l3_type.shape
-        
+
         manifest = {
             "name": base_name,
             "map": {
-                # map.bin holds the L1 (half-scale) data, so the manifest
-                # dimensions must be the L1 dimensions, not the full image's.
+                "width": l0_w,
+                "height": l0_h,
+                "num_land_tiles": l0_land
+            },
+            "map4x": {
                 "width": l1_w,
                 "height": l1_h,
                 "num_land_tiles": l1_land
             },
-            "map4x": {
+            "map16x": {
                 "width": l2_w,
                 "height": l2_h,
                 "num_land_tiles": l2_land
             },
-            "map16x": {
-                "width": l3_w,
-                "height": l3_h,
-                "num_land_tiles": l3_land
-            },
             "nations": []
         }
         
-        # Add nations from points
+        # Add nations from points. pixel_x/pixel_y are in full-image (L0) space,
+        # which is exactly what map.bin now uses - no scaling needed.
         for p in points:
             nation = {
                 "name": p.get("name", "Unknown"),
                 "flag": p.get("flag", "unknown"),
                 "coordinates": [
-                    int(p.get("pixel_x", 0) * 0.5),  # Scale for small version
-                    int(p.get("pixel_y", 0) * 0.5)
+                    int(p.get("pixel_x", 0)),
+                    int(p.get("pixel_y", 0))
                 ]
             }
             manifest["nations"].append(nation)

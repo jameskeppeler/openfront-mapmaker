@@ -5,17 +5,19 @@
 
 cd "$(dirname "$0")/webapp" || exit 1
 
-# Pick a Python 3 interpreter.
-PY=python3
-command -v "$PY" >/dev/null 2>&1 || PY=python
-
-# First run: create the virtual environment and install dependencies.
-if [ ! -d .venv ]; then
-  echo "First run: setting up the Python environment. This can take a few minutes..."
-  "$PY" -m venv .venv
-  ./.venv/bin/pip install --upgrade pip
-  ./.venv/bin/pip install -r requirements.txt
+# Make sure uv is on PATH (common install locations if the shell is minimal).
+command -v uv >/dev/null 2>&1 || export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+if ! command -v uv >/dev/null 2>&1; then
+  echo "ERROR: 'uv' is not installed. Install it, then run this again:"
+  echo "    brew install uv"
+  echo "  or: curl -LsSf https://astral.sh/uv/install.sh | sh"
+  exit 1
 fi
+
+# Sync the environment from the lockfile. uv downloads the right Python (3.11)
+# automatically if it is missing, and only reinstalls when something changed.
+echo "Preparing the Python environment (uv)..."
+uv sync || exit 1
 
 # Warn if the OpenTopography API key file is missing.
 if [ ! -f .env ]; then
@@ -30,8 +32,8 @@ fi
 # Open the browser once the server is ready (in the background).
 (
   for i in $(seq 1 30); do
-    if curl -sf http://localhost:5000/api/health >/dev/null 2>&1; then
-      open http://localhost:5000 2>/dev/null || xdg-open http://localhost:5000
+    if curl -sf http://localhost:5050/api/health >/dev/null 2>&1; then
+      open http://localhost:5050 2>/dev/null || xdg-open http://localhost:5050
       break
     fi
     sleep 1
@@ -39,4 +41,4 @@ fi
 ) &
 
 echo "Starting OpenFront Map Maker. Keep this window open; close it to stop."
-./.venv/bin/python app.py
+uv run python app.py

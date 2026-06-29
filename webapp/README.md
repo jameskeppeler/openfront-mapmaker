@@ -16,10 +16,14 @@ A polished web application for generating styled terrain maps from DEM data.
 
 ### 1. Install Dependencies
 
+This project uses [uv](https://docs.astral.sh/uv/). From the `webapp` folder:
+
 ```bash
 cd webapp
-pip install -r requirements.txt
+uv sync
 ```
+
+uv downloads the right Python (3.11) and installs everything from `uv.lock`.
 
 ### 2. Set Up Environment Variables
 
@@ -39,10 +43,10 @@ Get a free API key at: https://portal.opentopography.org/myopentopo
 ### 3. Run Locally
 
 ```bash
-python app.py
+uv run python app.py
 ```
 
-Open http://localhost:5000 in your browser.
+Open http://localhost:5050 in your browser.
 
 **Note:** In local development mode, authentication is skipped.
 
@@ -89,8 +93,8 @@ git push
    - **Name:** openfront-map-generator
    - **Root Directory:** webapp
    - **Runtime:** Python 3
-   - **Build Command:** `pip install -r requirements.txt`
-   - **Start Command:** `gunicorn app:app`
+   - **Build Command:** `pip install uv && uv sync --frozen`
+   - **Start Command:** `uv run gunicorn app:app`
 
 5. Add Environment Variables:
    - `OPENTOPO_API_KEY` - Your OpenTopography API key
@@ -117,7 +121,8 @@ For faster loading, you can host the frontend separately:
 webapp/
 ├── app.py              # Flask API server
 ├── map_processor.py    # DEM processing (replaces QGIS)
-├── requirements.txt    # Python dependencies
+├── pyproject.toml      # Python dependencies (uv)
+├── uv.lock             # Locked dependency versions
 ├── render.yaml         # Render deployment config
 ├── .env.example        # Environment variables template
 └── static/
