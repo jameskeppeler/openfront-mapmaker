@@ -45,9 +45,11 @@ class MapGenerator:
         img = Image.open(self.image_path).convert('RGBA')
         self.width, self.height = img.size
         
-        # Ensure even dimensions
-        self.width -= self.width % 2
-        self.height -= self.height % 2
+        # Normalize to a multiple of 8 so every downscale level has even
+        # dimensions (an odd level's half-scale minimap is one column short,
+        # causing the game's miniMap.ref(floor(x/2),...) to crash on the edge).
+        self.width -= self.width % 8
+        self.height -= self.height % 8
         img = img.crop((0, 0, self.width, self.height))
         
         pixels = np.array(img)

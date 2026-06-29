@@ -955,9 +955,15 @@ class MapProcessor:
         img = styled_image.convert('RGBA')
         width, height = img.size
         
-        # Ensure even dimensions
-        width -= width % 2
-        height -= height % 2
+        # Normalize to a multiple of 8 so every downscale level (map=full/2,
+        # map4x=full/4, map16x=full/8) has even dimensions. The game's minimap
+        # lookup does miniMap.ref(floor(x/2), floor(y/2)); if a level's width is
+        # odd, floor((W-1)/2) == half-width and indexes one column past the
+        # minimap -> "Invalid coordinates" crash. Multiples of 4 (what OpenFront
+        # uses) keep the full-res map.bin safe; we use 8 because our map.bin is
+        # the half-scale level, so the full must be /8 to keep map4x even too.
+        width -= width % 8
+        height -= height % 8
         img = img.crop((0, 0, width, height))
         
         pixels = np.array(img)
