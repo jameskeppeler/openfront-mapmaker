@@ -9,8 +9,10 @@ with no login**. Draw a region on a map and turn it into OpenFront terrain.
 - **macOS / Linux:** double-click **`Start-MapMaker.command`**
   (first time: `chmod +x Start-MapMaker.command`)
 
-On first run it creates a Python virtual environment, installs dependencies,
-and opens <http://localhost:5000>.
+The launcher uses [uv](https://docs.astral.sh/uv/). On first run it downloads the
+right Python, installs dependencies from `uv.lock`, and opens
+<http://localhost:5050>. (If you don't have uv: `brew install uv`, or
+`curl -LsSf https://astral.sh/uv/install.sh | sh`.)
 
 ## One-time: API key
 

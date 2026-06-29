@@ -1,13 +1,14 @@
 # Render deployment configuration
+# Set this service's Root Directory to "webapp" in the Render dashboard so the
+# build runs where pyproject.toml / uv.lock live.
 services:
   - type: web
     name: openfront-map-generator
     runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python -m gunicorn app:app --bind 0.0.0.0:$PORT
+    # uv installs the right Python (from .python-version) and the exact locked deps.
+    buildCommand: pip install uv && uv sync --frozen
+    startCommand: uv run gunicorn app:app --bind 0.0.0.0:$PORT
     envVars:
-      - key: PYTHON_VERSION
-        value: "3.11.0"
       - key: OPENTOPO_API_KEY
         sync: false
       - key: SUPABASE_URL

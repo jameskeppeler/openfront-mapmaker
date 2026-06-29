@@ -3,12 +3,25 @@ title OpenFront Map Maker
 REM Run from the webapp folder, relative to this script's location.
 pushd "%~dp0webapp"
 
-REM --- First run: create the Python virtual environment and install deps ---
-if not exist ".venv" (
-  echo First run: setting up the Python environment. This can take a few minutes...
-  python -m venv .venv
-  call ".venv\Scripts\python.exe" -m pip install --upgrade pip
-  call ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+REM --- Require uv ---
+where uv >nul 2>&1
+if errorlevel 1 (
+  echo ERROR: 'uv' is not installed.
+  echo Install it, then run this again:  winget install astral-sh.uv
+  echo   or see https://docs.astral.sh/uv/getting-started/installation/
+  pause
+  popd
+  exit /b 1
+)
+
+REM --- Sync the environment from the lockfile (uv fetches Python 3.11 if needed) ---
+echo Preparing the Python environment (uv)...
+uv sync
+if errorlevel 1 (
+  echo Failed to set up the environment.
+  pause
+  popd
+  exit /b 1
 )
 
 REM --- Warn if the OpenTopography API key file is missing ---
@@ -23,11 +36,11 @@ if not exist ".env" (
 
 echo Starting the Map Maker server...
 echo (A separate window will open - keep it open while making maps, close it to stop.)
-start "OpenFront Map Maker - close this window to stop" cmd /k ".venv\Scripts\python.exe app.py"
+start "OpenFront Map Maker - close this window to stop" cmd /k "uv run python app.py"
 
 echo Waiting for the Map Maker to be ready...
-powershell -NoProfile -Command "for ($i=0; $i -lt 30; $i++) { try { Invoke-WebRequest -Uri 'http://localhost:5000/api/health' -UseBasicParsing -TimeoutSec 2 | Out-Null; exit 0 } catch { Start-Sleep -Seconds 1 } } ; exit 1"
+powershell -NoProfile -Command "for ($i=0; $i -lt 30; $i++) { try { Invoke-WebRequest -Uri 'http://localhost:5050/api/health' -UseBasicParsing -TimeoutSec 2 | Out-Null; exit 0 } catch { Start-Sleep -Seconds 1 } } ; exit 1"
 
-start "" "http://localhost:5000"
+start "" "http://localhost:5050"
 popd
 exit /b
