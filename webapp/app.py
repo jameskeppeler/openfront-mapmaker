@@ -228,4 +228,7 @@ def download_file(map_id, filename):
 if __name__ == '__main__':
     # Default 5050: port 5000 is taken by AirPlay Receiver / Control Center on macOS.
     port = int(os.environ.get('PORT', 5050))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    # use_reloader=False: the auto-reloader can spawn an endless chain of
+    # restarting processes on Windows (it relaunches with a different python
+    # and never sets WERKZEUG_RUN_MAIN), leaving orphans stuck on the port.
+    app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False)
