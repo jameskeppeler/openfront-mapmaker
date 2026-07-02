@@ -501,10 +501,12 @@
                     
                     <div class="form-group">
                         <label class="form-label">DEM Source</label>
-                        <select id="demSource" class="form-select">
+                        <select id="demSource" class="form-select" onchange="updateAreaNotice()">
                             <option value="COP90" selected>Copernicus 90m (Recommended)</option>
                             <option value="COP30">Copernicus 30m (High Detail)</option>
+                            <option value="SRTMGL1">SRTM 30m (High Detail)</option>
                         </select>
+                        <div id="areaNotice" class="hidden" style="margin-top:8px; font-size:0.8rem; line-height:1.35; color:#fbbf24;"></div>
                     </div>
 
                     <div class="form-group">
@@ -909,6 +911,7 @@
                 document.getElementById('noBoundsText').classList.remove('hidden');
                 document.getElementById('boundsDisplay').classList.add('hidden');
                 document.getElementById('clearBoundsBtn').classList.add('hidden');
+                updateAreaNotice();
                 updateGenerateButton();
             });
         }
@@ -929,11 +932,46 @@
             // Calculate resolution (max 3M pixels)
             const resolution = calculateResolution(currentBounds);
             document.getElementById('resolutionDisplay').textContent = `${resolution.width} × ${resolution.height} px`;
-            
+
             document.getElementById('noBoundsText').classList.add('hidden');
             document.getElementById('boundsDisplay').classList.remove('hidden');
             document.getElementById('clearBoundsBtn').classList.remove('hidden');
+            updateAreaNotice();
             updateGenerateButton();
+        }
+
+        // Live, non-blocking guidance about the current selection: warns that a
+        // large high-detail area will be tiled (slower) and that only major
+        // water shows above the OSM detail threshold. Updates as the rectangle
+        // or the DEM source changes, so there is never a post-generation dead-end.
+        function updateAreaNotice() {
+            const el = document.getElementById('areaNotice');
+            if (!el) return;
+            if (!currentBounds) {
+                el.classList.add('hidden');
+                el.textContent = '';
+                return;
+            }
+            const areaDeg2 = Math.abs(
+                (currentBounds.north - currentBounds.south) *
+                (currentBounds.east - currentBounds.west)
+            );
+            const dem = document.getElementById('demSource').value;
+            const fine = (dem === 'COP30' || dem === 'SRTMGL1');
+            const msgs = [];
+            if (fine && areaDeg2 > 1.0) {
+                msgs.push('⏳ Large area at high detail — the DEM downloads in tiles and is stitched, so this may take a few minutes.');
+            }
+            if (areaDeg2 > 4.0) {
+                msgs.push('🌊 Above this size only major rivers and lakes are drawn (detailed OpenStreetMap water is used for smaller areas).');
+            }
+            if (msgs.length) {
+                el.innerHTML = msgs.join('<br>');
+                el.classList.remove('hidden');
+            } else {
+                el.classList.add('hidden');
+                el.textContent = '';
+            }
         }
         
         function updateGenerateButton() {
@@ -985,6 +1023,7 @@
             document.getElementById('boundsDisplay').classList.add('hidden');
             document.getElementById('clearBoundsBtn').classList.add('hidden');
             document.getElementById('resolutionDisplay').textContent = 'Select an area first';
+            updateAreaNotice();
             updateGenerateButton();
         }
         
