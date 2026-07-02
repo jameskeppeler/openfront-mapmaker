@@ -7,6 +7,7 @@ Uses GDAL/Rasterio to replicate the QGIS map generation workflow.
 import os
 import json
 import math
+import time
 import tempfile
 import requests
 import zipfile
@@ -18,8 +19,8 @@ from rasterio.warp import calculate_default_transform, reproject, Resampling
 from rasterio.merge import merge
 from rasterio.mask import mask
 from pyproj import Transformer
-from shapely.geometry import box, shape, Point
-from shapely.ops import transform
+from shapely.geometry import box, shape, Point, LineString
+from shapely.ops import transform, linemerge, unary_union
 
 
 # Game file constants
@@ -29,10 +30,18 @@ TYPE_LAND = 0
 TYPE_WATER = 1
 
 # Use detailed OpenStreetMap water for selections up to this size (deg^2);
-# larger areas use Natural Earth (Overpass would be too heavy/slow).
-OSM_MAX_AREA_DEG2 = 1.5
+# larger areas use Natural Earth (Overpass would be too heavy/slow). Raised
+# from 1.5 so province-sized maps still capture real lakes (e.g. Lake Mainit).
+OSM_MAX_AREA_DEG2 = 4.0
+# Above this size (deg^2), drop minor waterways (streams/ditches/drains) from the
+# OSM query so large-area requests stay fast; lakes and major rivers are kept.
+OSM_MINOR_WATERWAY_MAX_DEG2 = 1.5
 # Below this size (deg^2), prefer the finer COP30 DEM over COP90.
 SMALL_AREA_COP30_DEG2 = 0.25
+# Auto-tiling: when a single OpenTopography request is rejected as too large,
+# the bbox is split into quadrants and retried, then mosaicked. This caps the
+# recursion depth (4^depth tiles max) to bound the number of API calls.
+MAX_TILE_DEPTH = 3
 # Aim for up to this many named nation spawns (with real coordinates).
 NATION_TARGET = 30
 # If fewer than this many in-area names are found, pull extra place names from a
@@ -250,17 +259,81 @@ class MapProcessor:
             'metadata': metadata
         }
     
+    # OpenTopography DEM type codes, keyed by the UI's dem_source value.
+    DEMTYPE_MAP = {
+        'COP30': 'COP30',
+        'COP90': 'COP90',
+        'SRTMGL1': 'SRTMGL1',   # NASA SRTM 1 arc-second (~30m)
+        'SRTM15+': 'SRTMGL1',   # legacy alias
+    }
+
     def _download_dem(self, south: float, west: float, north: float, east: float,
                       dem_source: str) -> str:
-        """Download DEM from OpenTopography."""
-        
-        demtype_map = {
-            'COP30': 'COP30',
-            'COP90': 'COP90',
-            'SRTM15+': 'SRTMGL1'
-        }
-        demtype = demtype_map.get(dem_source, 'COP90')
-        
+        """Download DEM from OpenTopography, auto-tiling if the area is too large.
+
+        A single request is tried first. If OpenTopography rejects it as too
+        large for the chosen resolution, the bbox is split into quadrants and
+        each is fetched recursively, then the tiles are mosaicked into one
+        GeoTIFF. This removes the practical area limit at fine detail levels.
+        """
+        demtype = self.DEMTYPE_MAP.get(dem_source, 'COP90')
+
+        tiles = self._download_dem_tiles(south, west, north, east, demtype, depth=0)
+        if not tiles:
+            raise Exception("Failed to download DEM: no tiles returned")
+        if len(tiles) == 1:
+            return tiles[0]
+
+        print(f"Mosaicking {len(tiles)} DEM tile(s)...")
+        merged_path = os.path.join(
+            self.cache_dir, f"dem_{demtype}_{south}_{west}_{north}_{east}_merged.tif"
+        )
+        self._merge_tiles(tiles, merged_path)
+        return merged_path
+
+    def _download_dem_tiles(self, south: float, west: float, north: float,
+                            east: float, demtype: str, depth: int) -> list:
+        """Return paths to one or more DEM GeoTIFF tiles covering the bbox.
+
+        Tries a single request; on an "area too large" rejection, subdivides
+        into quadrants (up to MAX_TILE_DEPTH) and fetches each.
+        """
+        content = self._request_dem(south, west, north, east, demtype)
+        if content is not None:
+            tile_path = os.path.join(
+                self.cache_dir, f"dem_{demtype}_{south}_{west}_{north}_{east}.tif"
+            )
+            with open(tile_path, 'wb') as f:
+                f.write(content)
+            return [tile_path]
+
+        # Request was rejected as too large. Subdivide if we still can.
+        if depth >= MAX_TILE_DEPTH:
+            raise Exception(
+                "Area is too large for this detail level, even after tiling. "
+                "Try a smaller area or a coarser DEM (e.g. Copernicus 90m)."
+            )
+
+        mid_lat = (south + north) / 2.0
+        mid_lon = (west + east) / 2.0
+        quadrants = [
+            (south, west, mid_lat, mid_lon),
+            (south, mid_lon, mid_lat, east),
+            (mid_lat, west, north, mid_lon),
+            (mid_lat, mid_lon, north, east),
+        ]
+        print(f"DEM area too large at depth {depth}; splitting into 4 tiles...")
+        tiles = []
+        for (s, w, n, e) in quadrants:
+            tiles.extend(self._download_dem_tiles(s, w, n, e, demtype, depth + 1))
+            time.sleep(1)  # be polite to the OpenTopography API between tiles
+        return tiles
+
+    def _request_dem(self, south: float, west: float, north: float, east: float,
+                     demtype: str):
+        """Fetch one DEM tile. Returns bytes on success, None if the area was
+        rejected as too large (caller should subdivide), raises on other errors.
+        """
         url = "https://portal.opentopography.org/API/globaldem"
         params = {
             'demtype': demtype,
@@ -268,24 +341,46 @@ class MapProcessor:
             'north': north,
             'west': west,
             'east': east,
-            'outputFormat': 'GTiff'
+            'outputFormat': 'GTiff',
         }
-        
         if self.api_key:
             params['API_Key'] = self.api_key
-        
-        print(f"Requesting DEM from OpenTopography...")
+
+        print(f"Requesting DEM from OpenTopography ({demtype}) "
+              f"[{south:.3f},{west:.3f},{north:.3f},{east:.3f}]...")
         response = requests.get(url, params=params, timeout=300)
-        
-        if response.status_code != 200:
-            raise Exception(f"Failed to download DEM: {response.status_code} - {response.text[:200]}")
-        
-        # Save to temp file
-        dem_path = os.path.join(self.cache_dir, f"dem_{south}_{west}_{north}_{east}.tif")
-        with open(dem_path, 'wb') as f:
-            f.write(response.content)
-        
-        return dem_path
+
+        if response.status_code == 200:
+            return response.content
+
+        # OpenTopography returns 400 with an "area exceeds" style message when
+        # the request is too large. Signal the caller to tile instead of failing.
+        text = (response.text or "")[:300]
+        too_large = response.status_code == 400 and any(
+            kw in text.lower() for kw in ("exceed", "too large", "maximum", "area")
+        )
+        if too_large:
+            print(f"OpenTopography rejected area as too large: {text}")
+            return None
+
+        raise Exception(f"Failed to download DEM: {response.status_code} - {text}")
+
+    def _merge_tiles(self, tile_paths: list, out_path: str) -> None:
+        """Mosaic multiple DEM GeoTIFF tiles into a single file."""
+        srcs = [rasterio.open(p) for p in tile_paths]
+        try:
+            mosaic, out_transform = merge(srcs)
+            meta = srcs[0].meta.copy()
+            meta.update({
+                'height': mosaic.shape[1],
+                'width': mosaic.shape[2],
+                'transform': out_transform,
+            })
+            with rasterio.open(out_path, 'w', **meta) as dst:
+                dst.write(mosaic)
+        finally:
+            for s in srcs:
+                s.close()
     
     def _load_dem(self, dem_path: str, target_width: int, target_height: int) -> tuple:
         """Load DEM and resample to target size."""
@@ -466,10 +561,17 @@ class MapProcessor:
 
         water_color = (0, 0, 106)
         bbox = f"{south},{west},{north},{east}"
+        # For larger areas, keep only major waterways so Overpass stays fast;
+        # lakes (natural=water) are always included so real lakes are captured.
+        area_deg2 = abs((north - south) * (east - west))
+        if area_deg2 > OSM_MINOR_WATERWAY_MAX_DEG2:
+            waterway_filter = "^(river|canal)$"
+        else:
+            waterway_filter = "^(river|stream|canal|drain|ditch)$"
         query = (
             "[out:json][timeout:60];"
             "("
-            f'way["waterway"~"^(river|stream|canal|drain|ditch)$"]({bbox});'
+            f'way["waterway"~"{waterway_filter}"]({bbox});'
             f'way["natural"="water"]({bbox});'
             f'relation["natural"="water"]({bbox});'
             f'way["water"]({bbox});'
@@ -513,6 +615,40 @@ class MapProcessor:
             draw.polygon(pts, fill=water_color)
             return True
 
+        def draw_relation(el):
+            """Fill a multipolygon water relation.
+
+            A lake's outer boundary is often split across many unclosed member
+            ways (e.g. Lake Mainit = 32 segments). Filling each segment on its
+            own produces triangular artifacts, so stitch the outer segments into
+            continuous rings first, then fill each ring.
+            """
+            lines = []
+            for m in el.get("members", []):
+                if m.get("role") == "outer" and m.get("geometry"):
+                    coords = [(p["lon"], p["lat"]) for p in m["geometry"]]
+                    if len(coords) >= 2:
+                        lines.append(LineString(coords))
+            if not lines:
+                return 0
+            try:
+                merged = linemerge(unary_union(lines))
+            except Exception:
+                merged = None
+            if merged is None or merged.is_empty:
+                rings = [list(l.coords) for l in lines]
+            elif merged.geom_type == "MultiLineString":
+                rings = [list(g.coords) for g in merged.geoms]
+            else:
+                rings = [list(merged.coords)]
+            n = 0
+            for ring in rings:
+                pts = [to_px(x, y) for (x, y) in ring]
+                if len(pts) >= 3:
+                    draw.polygon(pts, fill=water_color)
+                    n += 1
+            return n
+
         drawn = 0
         for el in elements:
             etype = el.get("type")
@@ -528,10 +664,7 @@ class MapProcessor:
                 elif draw_poly(geom):
                     drawn += 1
             elif etype == "relation":
-                for m in el.get("members", []):
-                    if m.get("role") == "outer" and m.get("geometry"):
-                        if draw_poly(m["geometry"]):
-                            drawn += 1
+                drawn += draw_relation(el)
 
         print(f"OSM water: drew {drawn} feature(s) from {len(elements)} element(s)")
         return drawn
