@@ -230,7 +230,14 @@ def download_file(map_id, filename):
 if __name__ == '__main__':
     # Default 5050: port 5000 is taken by AirPlay Receiver / Control Center on macOS.
     port = int(os.environ.get('PORT', 5050))
+    print(f"\n  OpenFront Map Maker running at:  http://localhost:{port}\n")
     # use_reloader=False: the auto-reloader can spawn an endless chain of
     # restarting processes on Windows (it relaunches with a different python
     # and never sets WERKZEUG_RUN_MAIN), leaving orphans stuck on the port.
-    app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False)
+    # threaded=True: the dev server is single-threaded by default, so one slow
+    # or hung generation (DEM downloads can take minutes) would block every
+    # other request — including serving the page — making the app look frozen
+    # until a restart. Threading lets the UI stay responsive and a failed
+    # generation be retried without restarting the server.
+    app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False,
+            threaded=True)
