@@ -9,7 +9,7 @@ import json
 import tempfile
 import shutil
 from datetime import datetime
-from flask import Flask, request, jsonify, send_file, send_from_directory
+from flask import Flask, request, jsonify, send_file, send_from_directory, make_response
 from flask_cors import CORS
 from dotenv import load_dotenv
 from functools import wraps
@@ -64,8 +64,18 @@ def require_auth(f):
 
 @app.route('/')
 def index():
-    """Serve the main application page."""
-    return send_from_directory('static', 'index.html')
+    """Serve the main application page.
+
+    The page is served with no-cache headers so the browser always fetches the
+    latest UI. Without this, launching via the desktop shortcut (which opens a
+    tab in the existing browser) serves a stale cached index.html, so code
+    changes appear not to take effect until a manual hard-refresh.
+    """
+    resp = make_response(send_from_directory('static', 'index.html'))
+    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    return resp
 
 
 @app.route('/api/health')
