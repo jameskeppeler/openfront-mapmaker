@@ -187,6 +187,8 @@ def generate_map():
             'download_url': f'/api/download/{map_id}',
             'installed': installed,
             'install_error': install_error,
+            'dem_source_requested': result.get('dem_source_requested'),
+            'dem_source_used': result.get('dem_source_used'),
         })
         
     except Exception as e:

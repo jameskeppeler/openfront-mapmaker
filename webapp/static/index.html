@@ -1138,9 +1138,33 @@
             document.getElementById('progressOverlay').classList.remove('hidden');
         }
         
+        // Tell the user which DEM source actually produced the map, and warn
+        // clearly when a LiDAR request fell back (e.g. no coverage) — otherwise
+        // "no HD detail" is a silent mystery.
+        function demSourceBanner(data) {
+            const used = data.dem_source_used, req = data.dem_source_requested;
+            if (!used) return '';
+            const label = {
+                COP30: 'Copernicus 30m', COP90: 'Copernicus 90m', SRTMGL1: 'SRTM 30m',
+                USGS1m: 'USGS 3DEP 1m LiDAR', USGS10m: 'USGS 3DEP 10m LiDAR',
+                GEBCOIceTopo: 'GEBCO'
+            };
+            const usedLabel = label[used] || used;
+            const isLidarReq = req === 'USGS1m' || req === 'USGS10m';
+            if (isLidarReq && used !== req) {
+                return `<p class="progress-subtext" style="margin-top:0.75rem; font-size:0.8rem; color:#fbbf24;">
+                    ⚠️ No ${label[req] || req} coverage for this area — used <strong>${usedLabel}</strong> instead.
+                    Toggle the &ldquo;USGS LiDAR coverage (US)&rdquo; overlay to pick a covered area, or try USGS 10m.</p>`;
+            }
+            const emphasis = isLidarReq ? 'color:#4ade80;' : 'opacity:0.75;';
+            return `<p class="progress-subtext" style="margin-top:0.75rem; font-size:0.8rem; ${emphasis}">
+                DEM source: <strong>${usedLabel}</strong></p>`;
+        }
+
         function showSuccess(data) {
             const card = document.getElementById('progressCard');
             const info = data.installed;
+            const demBanner = demSourceBanner(data);
             if (info) {
                 // Auto-installed straight into the local game.
                 card.innerHTML = `
@@ -1150,6 +1174,7 @@
                         &ldquo;<strong>${info.display_name}</strong>&rdquo; is now in the game under the
                         <strong>Custom</strong> tab &mdash; the game tab refreshes itself.
                     </p>
+                    ${demBanner}
                     <button class="btn btn-primary" onclick="window.open('http://localhost:9000','openfront')">
                         ▶ Play in OpenFront
                     </button>
@@ -1169,6 +1194,7 @@
                     <div class="success-icon">✓</div>
                     <p class="progress-text">Map Generated!</p>
                     <p class="progress-subtext" style="margin-bottom: 1.5rem;">${msg}</p>
+                    ${demBanner}
                     <a href="${CONFIG.API_URL}${data.download_url}" class="btn btn-primary" style="display: inline-block; text-decoration: none;">
                         📥 Download ZIP
                     </a>

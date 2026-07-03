@@ -174,7 +174,10 @@ class MapProcessor:
 
         # Step 1: Download DEM
         print("Downloading DEM...")
-        dem_path = self._download_dem(south, west, north, east, dem_source)
+        dem_source_requested = dem_source
+        dem_path, dem_source_used = self._download_dem(
+            south, west, north, east, dem_source
+        )
         
         # Step 2: Load and process DEM
         print("Processing DEM...")
@@ -269,6 +272,8 @@ class MapProcessor:
                 "east": east
             },
             "origin": "top-left",
+            "dem_source_requested": dem_source_requested,
+            "dem_source_used": dem_source_used,
             "points": points
         }
         with open(json_path, 'w') as f:
@@ -282,7 +287,7 @@ class MapProcessor:
         depth_array = None
         try:
             print("Fetching bathymetry (GEBCO) for water depth...")
-            bathy_path = self._download_dem(south, west, north, east, "GEBCOIceTopo")
+            bathy_path, _ = self._download_dem(south, west, north, east, "GEBCOIceTopo")
             bathy_dem, _, _ = self._load_dem(bathy_path, width_px, height_px)
             depth_array = np.maximum(0.0, -bathy_dem.astype(np.float32))
             if os.path.exists(bathy_path):
@@ -303,14 +308,16 @@ class MapProcessor:
         print(f"Map generated successfully!")
         
         all_files = ["image.png", f"{base_name}.json"] + game_files
-        
+
         return {
             'files': all_files,
-            'metadata': metadata
+            'metadata': metadata,
+            'dem_source_requested': dem_source_requested,
+            'dem_source_used': dem_source_used,
         }
     
     def _download_dem(self, south: float, west: float, north: float, east: float,
-                      dem_source: str) -> str:
+                      dem_source: str):
         """Download DEM from OpenTopography, auto-tiling if the area is too large.
 
         A single request is tried first. If OpenTopography rejects it as too
@@ -320,6 +327,9 @@ class MapProcessor:
 
         USGS 3DEP LiDAR sources cover only the US; if the area has no LiDAR
         coverage we transparently fall back to a global source (COP30).
+
+        Returns (dem_path, source_actually_used) so the caller can tell the user
+        which source produced the map (e.g. whether a LiDAR request fell back).
         """
         if dem_source not in DEM_SOURCES:
             dem_source = 'COP90'
@@ -331,15 +341,19 @@ class MapProcessor:
                       f"({area_deg2:.1f} deg^2) will be slow and heavy; "
                       f"it downloads in tiles.")
             try:
-                return self._download_dem_source(south, west, north, east, dem_source)
+                path = self._download_dem_source(south, west, north, east, dem_source)
+                print(f"Using {dem_source} LiDAR for this area.")
+                return path, dem_source
             except NoCoverageError as e:
                 print(f"No {dem_source} LiDAR coverage for this area ({e}); "
                       f"falling back to {DEM_FALLBACK_SOURCE}.")
-                return self._download_dem_source(
+                path = self._download_dem_source(
                     south, west, north, east, DEM_FALLBACK_SOURCE
                 )
+                return path, DEM_FALLBACK_SOURCE
 
-        return self._download_dem_source(south, west, north, east, dem_source)
+        path = self._download_dem_source(south, west, north, east, dem_source)
+        return path, dem_source
 
     def _download_dem_source(self, south: float, west: float, north: float,
                              east: float, dem_source: str) -> str:
