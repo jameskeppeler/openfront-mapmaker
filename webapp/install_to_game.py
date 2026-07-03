@@ -14,6 +14,8 @@ import re
 import shutil
 
 GAME_FILES = ["map.bin", "map4x.bin", "map16x.bin", "manifest.json", "thumbnail.webp"]
+# Optional files copied only when present (older outputs won't have them).
+OPTIONAL_GAME_FILES = ["depth.bin"]
 
 
 def find_game_repo():
@@ -92,6 +94,10 @@ def install_map(output_dir, display_name, game_repo=None):
         if not os.path.exists(src):
             raise RuntimeError(f"Generated file missing: {fn}")
         shutil.copy2(src, os.path.join(dest, fn))
+    for fn in OPTIONAL_GAME_FILES:
+        src = os.path.join(output_dir, fn)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(dest, fn))
 
     # 2) Self-heal the manifest dimensions if needed.
     _repair_manifest_dims(dest)

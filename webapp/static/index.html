@@ -505,6 +505,8 @@
                             <option value="COP90" selected>Copernicus 90m (Recommended)</option>
                             <option value="COP30">Copernicus 30m (High Detail)</option>
                             <option value="SRTMGL1">SRTM 30m (High Detail)</option>
+                            <option value="USGS1m">USGS 3DEP 1m LiDAR (US only — highest detail)</option>
+                            <option value="USGS10m">USGS 3DEP 10m LiDAR (US only)</option>
                         </select>
                         <div id="areaNotice" class="hidden" style="margin-top:8px; font-size:0.8rem; line-height:1.35; color:#fbbf24;"></div>
                     </div>
@@ -852,6 +854,22 @@
                 maxZoom: 22
             });
 
+            // USGS 3DEP LiDAR coverage (US only). Toggle this on to see where the
+            // "USGS 1m/10m LiDAR" DEM sources have data before drawing an area —
+            // the same index the USGS Lidar Explorer uses. Layer 21 is the
+            // 1-meter DEM availability footprint in the 3DEPElevationIndex service.
+            const lidarCoverage = L.tileLayer.wms(
+                'https://index.nationalmap.gov/arcgis/services/3DEPElevationIndex/MapServer/WMSServer',
+                {
+                    layers: '21',
+                    format: 'image/png',
+                    transparent: true,
+                    opacity: 0.5,
+                    maxZoom: 22,
+                    attribution: 'LiDAR coverage: USGS 3DEP'
+                }
+            );
+
             // Default to the OpenTopoMap basemap (contour lines + hillshade).
             opentopo.addTo(map);
 
@@ -863,7 +881,8 @@
                 "Street Map": osm
             };
             const overlays = {
-                "Labels": labels
+                "Labels": labels,
+                "USGS LiDAR coverage (US)": lidarCoverage
             };
             L.control.layers(baseMaps, overlays).addTo(map);
             
@@ -957,8 +976,15 @@
                 (currentBounds.east - currentBounds.west)
             );
             const dem = document.getElementById('demSource').value;
-            const fine = (dem === 'COP30' || dem === 'SRTMGL1');
+            const isLidar = (dem === 'USGS1m' || dem === 'USGS10m');
+            const fine = (dem === 'COP30' || dem === 'SRTMGL1' || isLidar);
             const msgs = [];
+            if (isLidar) {
+                msgs.push('🛰️ USGS 3DEP LiDAR is US-only — toggle the "USGS LiDAR coverage (US)" overlay to confirm your area has data. Outside coverage it falls back to Copernicus 30m automatically.');
+            }
+            if (isLidar && dem === 'USGS1m' && areaDeg2 > 0.25) {
+                msgs.push('⚠️ 1m LiDAR over this area is very large and slow — consider a smaller area or USGS 10m.');
+            }
             if (fine && areaDeg2 > 1.0) {
                 msgs.push('⏳ Large area at high detail — the DEM downloads in tiles and is stitched, so this may take a few minutes.');
             }

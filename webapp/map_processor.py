@@ -28,6 +28,9 @@ MIN_ISLAND_SIZE = 60
 MIN_LAKE_SIZE = 200
 TYPE_LAND = 0
 TYPE_WATER = 1
+# Deepest ocean depth (metres) mapped to the darkest water shade in depth.bin.
+# ~6000 m covers all but the deepest trenches; deeper water clamps to max.
+DEPTH_MAX_M = 6000.0
 
 # Use detailed OpenStreetMap water for selections up to this size (deg^2);
 # larger areas use Natural Earth (Overpass would be too heavy/slow). Raised
@@ -35,7 +38,7 @@ TYPE_WATER = 1
 OSM_MAX_AREA_DEG2 = 4.0
 # Above this size (deg^2), drop minor waterways (streams/ditches/drains) from the
 # OSM query so large-area requests stay fast; lakes and major rivers are kept.
-OSM_MINOR_WATERWAY_MAX_DEG2 = 1.5
+OSM_MINOR_WATERWAY_MAX_DEG2 = 1.25
 # Below this size (deg^2), prefer the finer COP30 DEM over COP90.
 SMALL_AREA_COP30_DEG2 = 0.25
 # Auto-tiling: when a single OpenTopography request is rejected as too large,
@@ -103,6 +106,34 @@ NE_RIVERS_URL = "https://naturalearth.s3.amazonaws.com/10m_physical/ne_10m_river
 NE_LAKES_URL = "https://naturalearth.s3.amazonaws.com/10m_physical/ne_10m_lakes.zip"
 NE_ADMIN1_URL = "https://naturalearth.s3.amazonaws.com/10m_cultural/ne_10m_admin_1_states_provinces.zip"
 NE_ADMIN0_URL = "https://naturalearth.s3.amazonaws.com/10m_cultural/ne_10m_admin_0_countries.zip"
+
+# DEM sources -> which OpenTopography endpoint + query parameter carries them.
+# Global sources use /API/globaldem?demtype=...; USGS 3DEP LiDAR uses the
+# separate /API/usgsdem?datasetName=... endpoint, which only covers the US
+# (see https://apps.nationalmap.gov/lidar-explorer/). GEBCO is global
+# topography+bathymetry (negative values are ocean depth), used for water-depth
+# coloring rather than as a primary land DEM.
+GLOBALDEM_URL = "https://portal.opentopography.org/API/globaldem"
+USGSDEM_URL = "https://portal.opentopography.org/API/usgsdem"
+DEM_SOURCES = {
+    # ui_key:      (endpoint,      param_name,    param_value)
+    "COP30":        (GLOBALDEM_URL, "demtype",     "COP30"),
+    "COP90":        (GLOBALDEM_URL, "demtype",     "COP90"),
+    "SRTMGL1":      (GLOBALDEM_URL, "demtype",     "SRTMGL1"),
+    "SRTM15+":      (GLOBALDEM_URL, "demtype",     "SRTMGL1"),  # legacy alias
+    "USGS1m":       (USGSDEM_URL,   "datasetName", "USGS1m"),   # LiDAR, US only
+    "USGS10m":      (USGSDEM_URL,   "datasetName", "USGS10m"),  # LiDAR, US only
+    "GEBCOIceTopo": (GLOBALDEM_URL, "demtype",     "GEBCOIceTopo"),  # bathymetry
+}
+# USGS 3DEP LiDAR sources have limited (US) coverage; when a request lands
+# outside coverage we transparently fall back to this global source.
+DEM_FALLBACK_SOURCE = "COP30"
+LIDAR_SOURCES = {"USGS1m", "USGS10m"}
+
+
+class NoCoverageError(Exception):
+    """Raised when a DEM source has no data for the requested area (as opposed
+    to the area being too large, which triggers tiling instead)."""
 
 
 class MapProcessor:
@@ -211,7 +242,10 @@ class MapProcessor:
                 except Exception as e:
                     print(f"Warning: nearby name pool failed: {e}")
         print(f"Found {len(points)} named spawns (+{len(extra_names)} pool names)")
-        
+
+        # De-cluster spawns so nations aren't packed into one corner.
+        points = self._space_out_spawns(points, width_px, height_px)
+
         # Step 6: Save outputs
         print("Saving outputs...")
         base_name = name.lower().replace(' ', '')
@@ -240,12 +274,28 @@ class MapProcessor:
         with open(json_path, 'w') as f:
             json.dump(metadata, f, indent=2)
         
+        # Step 6b: Bathymetry for cosmetic water-depth coloring (depth.bin).
+        # GEBCO is global topo+bathymetry (~450m); negative values are ocean
+        # depth. This is purely a render-time color channel in the game and does
+        # NOT affect map.bin / naval pathfinding. Failure is non-fatal (water
+        # simply renders without a depth gradient).
+        depth_array = None
+        try:
+            print("Fetching bathymetry (GEBCO) for water depth...")
+            bathy_path = self._download_dem(south, west, north, east, "GEBCOIceTopo")
+            bathy_dem, _, _ = self._load_dem(bathy_path, width_px, height_px)
+            depth_array = np.maximum(0.0, -bathy_dem.astype(np.float32))
+            if os.path.exists(bathy_path):
+                os.remove(bathy_path)
+        except Exception as e:
+            print(f"Bathymetry unavailable, water depth will be flat: {e}")
+
         # Step 7: Generate game files (bin files, manifest, thumbnail)
         print("Generating game files...")
         game_files = self._generate_game_files(
-            styled_image, base_name, points, extra_names
+            styled_image, base_name, points, extra_names, depth_array
         )
-        
+
         # Clean up temp DEM file
         if os.path.exists(dem_path):
             os.remove(dem_path)
@@ -259,14 +309,6 @@ class MapProcessor:
             'metadata': metadata
         }
     
-    # OpenTopography DEM type codes, keyed by the UI's dem_source value.
-    DEMTYPE_MAP = {
-        'COP30': 'COP30',
-        'COP90': 'COP90',
-        'SRTMGL1': 'SRTMGL1',   # NASA SRTM 1 arc-second (~30m)
-        'SRTM15+': 'SRTMGL1',   # legacy alias
-    }
-
     def _download_dem(self, south: float, west: float, north: float, east: float,
                       dem_source: str) -> str:
         """Download DEM from OpenTopography, auto-tiling if the area is too large.
@@ -275,10 +317,34 @@ class MapProcessor:
         large for the chosen resolution, the bbox is split into quadrants and
         each is fetched recursively, then the tiles are mosaicked into one
         GeoTIFF. This removes the practical area limit at fine detail levels.
-        """
-        demtype = self.DEMTYPE_MAP.get(dem_source, 'COP90')
 
-        tiles = self._download_dem_tiles(south, west, north, east, demtype, depth=0)
+        USGS 3DEP LiDAR sources cover only the US; if the area has no LiDAR
+        coverage we transparently fall back to a global source (COP30).
+        """
+        if dem_source not in DEM_SOURCES:
+            dem_source = 'COP90'
+
+        if dem_source in LIDAR_SOURCES:
+            area_deg2 = abs((north - south) * (east - west))
+            if area_deg2 > OSM_MAX_AREA_DEG2:
+                print(f"Warning: {dem_source} LiDAR over a large area "
+                      f"({area_deg2:.1f} deg^2) will be slow and heavy; "
+                      f"it downloads in tiles.")
+            try:
+                return self._download_dem_source(south, west, north, east, dem_source)
+            except NoCoverageError as e:
+                print(f"No {dem_source} LiDAR coverage for this area ({e}); "
+                      f"falling back to {DEM_FALLBACK_SOURCE}.")
+                return self._download_dem_source(
+                    south, west, north, east, DEM_FALLBACK_SOURCE
+                )
+
+        return self._download_dem_source(south, west, north, east, dem_source)
+
+    def _download_dem_source(self, south: float, west: float, north: float,
+                             east: float, dem_source: str) -> str:
+        """Download+mosaic all tiles for one specific DEM source."""
+        tiles = self._download_dem_tiles(south, west, north, east, dem_source, depth=0)
         if not tiles:
             raise Exception("Failed to download DEM: no tiles returned")
         if len(tiles) == 1:
@@ -286,22 +352,25 @@ class MapProcessor:
 
         print(f"Mosaicking {len(tiles)} DEM tile(s)...")
         merged_path = os.path.join(
-            self.cache_dir, f"dem_{demtype}_{south}_{west}_{north}_{east}_merged.tif"
+            self.cache_dir,
+            f"dem_{dem_source}_{south}_{west}_{north}_{east}_merged.tif",
         )
         self._merge_tiles(tiles, merged_path)
         return merged_path
 
     def _download_dem_tiles(self, south: float, west: float, north: float,
-                            east: float, demtype: str, depth: int) -> list:
+                            east: float, dem_source: str, depth: int) -> list:
         """Return paths to one or more DEM GeoTIFF tiles covering the bbox.
 
         Tries a single request; on an "area too large" rejection, subdivides
-        into quadrants (up to MAX_TILE_DEPTH) and fetches each.
+        into quadrants (up to MAX_TILE_DEPTH) and fetches each. A NoCoverageError
+        propagates so the caller can fall back to a different source.
         """
-        content = self._request_dem(south, west, north, east, demtype)
+        content = self._request_dem(south, west, north, east, dem_source)
         if content is not None:
             tile_path = os.path.join(
-                self.cache_dir, f"dem_{demtype}_{south}_{west}_{north}_{east}.tif"
+                self.cache_dir,
+                f"dem_{dem_source}_{south}_{west}_{north}_{east}.tif",
             )
             with open(tile_path, 'wb') as f:
                 f.write(content)
@@ -325,18 +394,19 @@ class MapProcessor:
         print(f"DEM area too large at depth {depth}; splitting into 4 tiles...")
         tiles = []
         for (s, w, n, e) in quadrants:
-            tiles.extend(self._download_dem_tiles(s, w, n, e, demtype, depth + 1))
+            tiles.extend(self._download_dem_tiles(s, w, n, e, dem_source, depth + 1))
             time.sleep(1)  # be polite to the OpenTopography API between tiles
         return tiles
 
     def _request_dem(self, south: float, west: float, north: float, east: float,
-                     demtype: str):
+                     dem_source: str):
         """Fetch one DEM tile. Returns bytes on success, None if the area was
-        rejected as too large (caller should subdivide), raises on other errors.
+        rejected as too large (caller should subdivide), raises NoCoverageError
+        if the source has no data for the area, raises Exception on other errors.
         """
-        url = "https://portal.opentopography.org/API/globaldem"
+        url, param_name, param_value = DEM_SOURCES[dem_source]
         params = {
-            'demtype': demtype,
+            param_name: param_value,
             'south': south,
             'north': north,
             'west': west,
@@ -346,7 +416,7 @@ class MapProcessor:
         if self.api_key:
             params['API_Key'] = self.api_key
 
-        print(f"Requesting DEM from OpenTopography ({demtype}) "
+        print(f"Requesting DEM from OpenTopography ({dem_source}) "
               f"[{south:.3f},{west:.3f},{north:.3f},{east:.3f}]...")
         response = requests.get(url, params=params, timeout=300)
 
@@ -356,12 +426,25 @@ class MapProcessor:
         # OpenTopography returns 400 with an "area exceeds" style message when
         # the request is too large. Signal the caller to tile instead of failing.
         text = (response.text or "")[:300]
+        low = text.lower()
         too_large = response.status_code == 400 and any(
-            kw in text.lower() for kw in ("exceed", "too large", "maximum", "area")
+            kw in low for kw in ("exceed", "too large", "maximum", "area")
         )
         if too_large:
             print(f"OpenTopography rejected area as too large: {text}")
             return None
+
+        # USGS 3DEP LiDAR only covers parts of the US. An out-of-coverage
+        # request comes back as an error / "no data" rather than a too-large
+        # rejection; signal the caller to fall back to a global source.
+        no_coverage = dem_source in LIDAR_SOURCES and (
+            response.status_code in (204, 404)
+            or any(kw in low for kw in ("no data", "not available", "no dem",
+                                        "outside", "coverage", "not found"))
+            or not response.content
+        )
+        if no_coverage:
+            raise NoCoverageError(f"{response.status_code}: {text[:120]}")
 
         raise Exception(f"Failed to download DEM: {response.status_code} - {text}")
 
@@ -450,10 +533,17 @@ class MapProcessor:
                 f"{round(H*100)}% highlands / {round(M*100)}% mountains"
             )
         else:
-            lo = float(np.percentile(vals, 2))
-            hi = float(np.percentile(vals, 98))
-            if hi - lo < 1e-6:
-                hi = lo + 1.0
+            # Percentile clip keeps a few outlier peaks/pits from squashing the
+            # whole ramp. 1/99 (vs the old 2/98) preserves more distinction among
+            # high peaks so mountains don't all flatten to the same max level.
+            lo = float(np.percentile(vals, 1))
+            hi = float(np.percentile(vals, 99))
+            # Minimum-relief floor: a nearly-flat region has a tiny lo..hi span,
+            # which the stretch would blow up into fake mountains. Hold the span
+            # at >= MIN_RELIEF_M so genuinely flat land stays plains.
+            MIN_RELIEF_M = 50.0
+            if hi - lo < MIN_RELIEF_M:
+                hi = lo + MIN_RELIEF_M
             norm = np.clip((vals - lo) / (hi - lo), 0.0, 1.0)
             idx = np.round(norm * (K - 1)).astype(np.int32)
             print(
@@ -1077,7 +1167,7 @@ class MapProcessor:
     # Game File Generation (map.bin, map4x.bin, map16x.bin, manifest.json, thumbnail.webp)
     # =========================================================================
     
-    def _generate_game_files(self, styled_image: Image.Image, base_name: str, points: list, extra_names: list = None) -> list:
+    def _generate_game_files(self, styled_image: Image.Image, base_name: str, points: list, extra_names: list = None, depth_array=None) -> list:
         """
         Generate OpenFront game files from the styled image.
         
@@ -1116,15 +1206,24 @@ class MapProcessor:
         
         terrain_shore = np.zeros((height, width), dtype=bool)
         terrain_ocean = np.zeros((height, width), dtype=bool)
-        
+
+        # Scale the "small feature" cleanup thresholds to the map's resolution so
+        # they mean roughly the same real-world size regardless of map size. The
+        # original absolute constants are kept as floors (so small maps behave as
+        # before); only larger maps raise the bar. Fractions are calibrated so the
+        # floors dominate up to ~10 megapixels.
+        total_px = width * height
+        min_island = max(MIN_ISLAND_SIZE, int(total_px * 6e-6))
+        min_lake = max(MIN_LAKE_SIZE, int(total_px * 2e-5))
+
         # Remove small islands
         terrain_type, terrain_mag = self._remove_small_areas(
-            terrain_type, terrain_mag, TYPE_LAND, MIN_ISLAND_SIZE, TYPE_WATER
+            terrain_type, terrain_mag, TYPE_LAND, min_island, TYPE_WATER
         )
-        
+
         # Process water (identify oceans, remove small lakes, calc distances)
         terrain_type, terrain_mag, terrain_shore, terrain_ocean = self._process_water(
-            terrain_type, terrain_mag, terrain_shore, terrain_ocean
+            terrain_type, terrain_mag, terrain_shore, terrain_ocean, min_lake
         )
         
         # Build LOD minimaps from the full-res terrain (L0):
@@ -1151,6 +1250,27 @@ class MapProcessor:
         with open(os.path.join(self.output_dir, "map.bin"), "wb") as f:
             f.write(l0_data)
         generated_files.append("map.bin")
+
+        # depth.bin: cosmetic per-tile ocean depth, aligned 1:1 with map.bin (L0).
+        # 1 byte/tile, 0 = land/shore/shallow ... 255 = deepest. A perceptual
+        # (sqrt) scale gives visible near-shore gradients. This is a render-only
+        # sidecar the game colors water with; it never touches map.bin, so naval
+        # pathfinding is unaffected. Only written when bathymetry was available.
+        if depth_array is not None:
+            l0_h, l0_w = terrain_type.shape
+            depth_l0 = np.asarray(depth_array, dtype=np.float32)[:l0_h, :l0_w]
+            if depth_l0.shape == terrain_type.shape:
+                depth_norm = np.sqrt(np.clip(depth_l0 / DEPTH_MAX_M, 0.0, 1.0))
+                depth_byte = np.round(depth_norm * 255).astype(np.uint8)
+                depth_byte[terrain_type != TYPE_WATER] = 0  # depth only for water
+                with open(os.path.join(self.output_dir, "depth.bin"), "wb") as f:
+                    f.write(depth_byte.tobytes())
+                generated_files.append("depth.bin")
+                print(f"Wrote depth.bin (max depth "
+                      f"{float(depth_l0.max()):.0f}m)")
+            else:
+                print(f"Skipping depth.bin: shape {depth_l0.shape} != "
+                      f"terrain {terrain_type.shape}")
 
         with open(os.path.join(self.output_dir, "map4x.bin"), "wb") as f:
             f.write(l1_data)
@@ -1218,6 +1338,51 @@ class MapProcessor:
         
         return generated_files
     
+    def _space_out_spawns(self, points, width, height, min_frac=0.045):
+        """De-cluster nation spawns so they aren't packed together.
+
+        Greedily keeps points by prominence (largest area first), dropping any
+        that fall within min_frac * map-diagonal of an already-kept point. This
+        spreads nations out for more balanced starts. Never drops below
+        NATION_MIN: if spacing would leave too few, the largest rejected points
+        are added back.
+        """
+        if len(points) <= NATION_MIN:
+            return points
+        diag = math.hypot(width, height)
+        min_dist_sq = (min_frac * diag) ** 2
+        ordered = sorted(points, key=lambda p: p.get("area", 0) or 0, reverse=True)
+        kept, rejected = [], []
+        for p in ordered:
+            px, py = p.get("pixel_x", 0), p.get("pixel_y", 0)
+            far_enough = all(
+                (px - q.get("pixel_x", 0)) ** 2 + (py - q.get("pixel_y", 0)) ** 2
+                >= min_dist_sq
+                for q in kept
+            )
+            (kept if far_enough else rejected).append(p)
+        # Backfill to the NATION_MIN floor if spacing was too aggressive for the
+        # available geography. Add rejects farthest from the kept set first
+        # (farthest-point sampling) so even the fallback stays as spread as
+        # possible rather than re-clustering.
+        while len(kept) < NATION_MIN and rejected:
+            best = max(
+                rejected,
+                key=lambda p: min(
+                    (p.get("pixel_x", 0) - q.get("pixel_x", 0)) ** 2
+                    + (p.get("pixel_y", 0) - q.get("pixel_y", 0)) ** 2
+                    for q in kept
+                ),
+            )
+            rejected.remove(best)
+            kept.append(best)
+        if len(kept) < len(points):
+            print(
+                f"Spawn spacing: kept {len(kept)}/{len(points)} spawns "
+                f"(min gap {math.sqrt(min_dist_sq):.0f}px)"
+            )
+        return kept
+
     def _remove_small_areas(self, t_type, t_mag, target_type, min_size, replace_with):
         """Remove small islands or lakes."""
         try:
@@ -1241,7 +1406,7 @@ class MapProcessor:
         
         return t_type, t_mag
     
-    def _process_water(self, t_type, t_mag, t_shore, t_ocean):
+    def _process_water(self, t_type, t_mag, t_shore, t_ocean, min_lake_size=MIN_LAKE_SIZE):
         """Process water bodies - identify oceans, remove small lakes, calc distances."""
         try:
             from scipy.ndimage import label, distance_transform_cdt, binary_dilation
@@ -1268,11 +1433,11 @@ class MapProcessor:
             print(f"Identified ocean with {sizes[largest_label]} tiles")
             
             # Remove small lakes
-            small_labels = water_labels[sizes[water_labels] < MIN_LAKE_SIZE]
+            small_labels = water_labels[sizes[water_labels] < min_lake_size]
             remove_mask = np.isin(labeled, small_labels)
             t_type[remove_mask] = TYPE_LAND
             t_mag[remove_mask] = 0
-            print(f"Removed {len(small_labels)} lakes smaller than {MIN_LAKE_SIZE}")
+            print(f"Removed {len(small_labels)} lakes smaller than {min_lake_size}")
             
             water_mask = (t_type == TYPE_WATER)
             
