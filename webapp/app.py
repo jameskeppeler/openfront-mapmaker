@@ -118,6 +118,10 @@ def generate_map():
         dem_source = data.get('dem_source', 'COP90')
         width_px = data.get('width_px')
         height_px = data.get('height_px')
+        try:
+            rotation_deg = float(data.get('rotation_deg', 0) or 0)
+        except (TypeError, ValueError):
+            rotation_deg = 0.0
         
         if not bounds:
             return jsonify({'error': 'Bounds are required'}), 400
@@ -178,6 +182,7 @@ def generate_map():
             dem_source=dem_source,
             plains_frac=plains_frac,
             highland_frac=highland_frac,
+            rotation_deg=rotation_deg,
         )
         
         # Auto-install into the local OpenFront game (copy + register so it

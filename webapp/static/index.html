@@ -501,7 +501,7 @@
                     
                     <div class="form-group">
                         <label class="form-label">DEM Source</label>
-                        <select id="demSource" class="form-select" onchange="updateAreaNotice()">
+                        <select id="demSource" class="form-select" onchange="onDetailSettingsChange()">
                             <option value="COP90" selected>Copernicus 90m (Recommended)</option>
                             <option value="COP30">Copernicus 30m (High Detail)</option>
                             <option value="SRTMGL1">SRTM 30m (High Detail)</option>
@@ -513,11 +513,15 @@
 
                     <div class="form-group">
                         <label class="form-label">Output Size</label>
-                        <select id="outputSize" class="form-select" onchange="refreshResolutionInfo()">
+                        <select id="outputSize" class="form-select" onchange="onDetailSettingsChange()">
                             <option value="3000000" selected>Standard (3 MP)</option>
                             <option value="6000000">High (6 MP — slower to generate)</option>
                             <option value="8000000">Max (8 MP — largest official map size)</option>
                         </select>
+                        <label class="form-label" style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:8px; font-weight:normal;">
+                            <input type="checkbox" id="detailLockToggle" checked onchange="onDetailSettingsChange()" style="width:auto; cursor:pointer;">
+                            Full-detail lock (limit selection size to the DEM's real resolution)
+                        </label>
                     </div>
 
                     <div class="form-group">
@@ -574,6 +578,13 @@
                                 <div class="bounds-label">East</div>
                                 <div class="bounds-value" id="boundEast">-</div>
                             </div>
+                        </div>
+                        <div style="margin-top:10px;">
+                            <div class="bounds-label" style="display:flex; justify-content:space-between;">
+                                <span>Rotation</span><span id="rotationValue">0°</span>
+                            </div>
+                            <input type="range" id="rotationSlider" min="-90" max="90" value="0" step="1"
+                                   style="width:100%; cursor:pointer;" oninput="setRotation(this.value)">
                         </div>
                     </div>
                 </div>
@@ -921,16 +932,23 @@
             });
             map.addControl(drawControl);
             
-            // Handle draw events
+            // Handle draw events. Selections are clamped so the chosen DEM's
+            // full detail survives at the chosen output size (see clampToDetail).
             map.on(L.Draw.Event.CREATED, (e) => {
-                drawnItems.clearLayers();
-                drawnItems.addLayer(e.layer);
-                updateBounds(e.layer.getBounds());
+                const b = e.layer.getBounds();
+                applySelection({
+                    south: b.getSouth(), west: b.getWest(),
+                    north: b.getNorth(), east: b.getEast(),
+                });
             });
-            
+
             map.on(L.Draw.Event.EDITED, (e) => {
                 e.layers.eachLayer((layer) => {
-                    updateBounds(layer.getBounds());
+                    const b = layer.getBounds();
+                    applySelection({
+                        south: b.getSouth(), west: b.getWest(),
+                        north: b.getNorth(), east: b.getEast(),
+                    });
                 });
             });
             
@@ -958,6 +976,7 @@
             document.getElementById('boundEast').textContent = currentBounds.east.toFixed(4);
             
             refreshResolutionInfo();
+            drawRotatedPreview();
 
             document.getElementById('noBoundsText').classList.add('hidden');
             document.getElementById('boundsDisplay').classList.remove('hidden');
@@ -986,6 +1005,9 @@
             const isLidar = (dem === 'USGS1m' || dem === 'USGS10m');
             const fine = (dem === 'COP30' || dem === 'SRTMGL1' || isLidar);
             const msgs = [];
+            if (lastClampNote) {
+                msgs.push(lastClampNote);
+            }
             if (isLidar) {
                 msgs.push('🛰️ USGS 3DEP LiDAR is US-only — toggle the "USGS LiDAR coverage (US)" overlay to confirm your area has data. Outside coverage it falls back to Copernicus 30m automatically.');
                 // The output pixel size caps visible detail regardless of the
@@ -1032,6 +1054,104 @@
             document.getElementById('mountainPct').textContent = Math.max(0, Math.round(100 - p - h));
         }
         
+        // ---------- Full-detail selection clamp + rotation ----------
+
+        // Native ground resolution of each DEM source (metres).
+        const DEM_RES_M = { COP90: 90, COP30: 30, SRTMGL1: 30, USGS1m: 1, USGS10m: 10 };
+        let currentRotation = 0;      // degrees, CCW about the box center
+        let rotatedPreview = null;    // L.polygon showing the rotated selection
+        let lastClampNote = '';       // message shown when a selection was shrunk
+
+        // Largest ground area (m^2) whose output pixels still match the DEM's
+        // native resolution: pixels * res^2.
+        function maxDetailAreaM2() {
+            const res = DEM_RES_M[document.getElementById('demSource').value] || 90;
+            const sel = document.getElementById('outputSize');
+            const maxPx = sel ? parseInt(sel.value, 10) : 3000000;
+            return { areaM2: maxPx * res * res, res: res };
+        }
+
+        // Shrink bounds around their center so the selection keeps full DEM
+        // detail at the chosen output size. Returns {bounds, clamped}.
+        function clampToDetail(b) {
+            if (!document.getElementById('detailLockToggle')?.checked) {
+                return { bounds: b, clamped: false };
+            }
+            const cLat = (b.north + b.south) / 2;
+            const latC = Math.cos(cLat * Math.PI / 180);
+            const wM = (b.east - b.west) * 111320 * latC;
+            const hM = (b.north - b.south) * 110540;
+            const { areaM2, res } = maxDetailAreaM2();
+            if (wM * hM <= areaM2) return { bounds: b, clamped: false };
+            const s = Math.sqrt(areaM2 / (wM * hM));
+            const cLon = (b.east + b.west) / 2;
+            const halfW = (b.east - b.west) / 2 * s;
+            const halfH = (b.north - b.south) / 2 * s;
+            const nb = { south: cLat - halfH, west: cLon - halfW,
+                         north: cLat + halfH, east: cLon + halfW };
+            const kmW = (wM * s / 1000), kmH = (hM * s / 1000);
+            lastClampNote = `📐 Selection clamped to ~${kmW < 10 ? kmW.toFixed(1) : Math.round(kmW)} × ${kmH < 10 ? kmH.toFixed(1) : Math.round(kmH)} km — the largest area that keeps full ${res}m detail at the chosen output size. Untick "Full-detail lock" to draw bigger.`;
+            return { bounds: nb, clamped: true };
+        }
+
+        // Replace the drawn rectangle with (possibly clamped) bounds and
+        // refresh everything that depends on the selection.
+        function applySelection(b) {
+            const r = clampToDetail(b);
+            if (!r.clamped) lastClampNote = '';
+            drawnItems.clearLayers();
+            const rect = L.rectangle([
+                [r.bounds.south, r.bounds.west],
+                [r.bounds.north, r.bounds.east],
+            ], { color: '#22c55e', weight: 2, fillOpacity: currentRotation ? 0.02 : 0.1, dashArray: currentRotation ? '6 6' : null });
+            drawnItems.addLayer(rect);
+            updateBounds(rect.getBounds());
+        }
+
+        // Corners of the current selection rotated about its center (in the
+        // local metric frame, mirroring the backend GeoGrid math).
+        function rotatedCorners(b, deg) {
+            const cLat = (b.north + b.south) / 2, cLon = (b.east + b.west) / 2;
+            const mLat = 110540, mLon = 111320 * Math.cos(cLat * Math.PI / 180);
+            const hw = (b.east - b.west) / 2 * mLon, hh = (b.north - b.south) / 2 * mLat;
+            const t = deg * Math.PI / 180, c = Math.cos(t), s = Math.sin(t);
+            // Box-frame corners (u right, v down) -> world (east, north).
+            return [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(([u, v]) => {
+                const e = u * c + v * s, n = u * s - v * c;
+                return [cLat + n / mLat, cLon + e / mLon];
+            });
+        }
+
+        function drawRotatedPreview() {
+            if (rotatedPreview) { map.removeLayer(rotatedPreview); rotatedPreview = null; }
+            if (!currentBounds || !currentRotation) return;
+            rotatedPreview = L.polygon(rotatedCorners(currentBounds, currentRotation), {
+                color: '#f59e0b', weight: 2, fillOpacity: 0.12, interactive: false,
+            }).addTo(map);
+        }
+
+        function setRotation(v) {
+            currentRotation = parseFloat(v) || 0;
+            document.getElementById('rotationValue').textContent = `${currentRotation}°`;
+            // Restyle the axis-aligned rect: it becomes a faint guide when the
+            // real (rotated) selection is shown by the orange polygon.
+            drawnItems.eachLayer((l) => l.setStyle && l.setStyle({
+                fillOpacity: currentRotation ? 0.02 : 0.1,
+                dashArray: currentRotation ? '6 6' : null,
+            }));
+            drawRotatedPreview();
+        }
+
+        // DEM source / output size / detail-lock changed: re-clamp the current
+        // selection to the new detail limit and refresh the readouts.
+        function onDetailSettingsChange() {
+            if (currentBounds) {
+                applySelection(currentBounds);
+            } else {
+                updateAreaNotice();
+            }
+        }
+
         // Recompute the resolution readout (+ notices) for the current
         // selection — called when the rectangle, DEM source, or output size
         // changes, so the px / m-per-px numbers always reflect what Generate
@@ -1085,6 +1205,8 @@
         function clearSelection() {
             drawnItems.clearLayers();
             currentBounds = null;
+            lastClampNote = '';
+            if (rotatedPreview) { map.removeLayer(rotatedPreview); rotatedPreview = null; }
             document.getElementById('noBoundsText').classList.remove('hidden');
             document.getElementById('boundsDisplay').classList.add('hidden');
             document.getElementById('clearBoundsBtn').classList.add('hidden');
@@ -1133,7 +1255,8 @@
                     dem_source: demSource,
                     api_key: userApiKey,
                     width_px: resolution.width,
-                    height_px: resolution.height
+                    height_px: resolution.height,
+                    rotation_deg: currentRotation
                 };
                 // Advanced: only send a custom terrain mix when enabled;
                 // otherwise the backend uses the natural elevation histogram.

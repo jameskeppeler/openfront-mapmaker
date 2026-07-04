@@ -136,6 +136,86 @@ class NoCoverageError(Exception):
     to the area being too large, which triggers tiling instead)."""
 
 
+class GeoGrid:
+    """Pixel <-> WGS84 mapping for an optionally *rotated* selection box.
+
+    The selection is the axis-aligned (south, west, north, east) box rotated
+    ``rotation_deg`` counter-clockwise about its center. Pixel (0, 0) is the
+    rotated box's top-left corner; x runs along the box's width and y down its
+    height. With rotation 0 this reduces exactly to the old linear mapping, so
+    unrotated maps are bit-identical to before.
+
+    Rotation is performed in a local metric frame at the box center (with
+    cos-latitude correction), so a box drawn at any angle keeps its real
+    ground dimensions.
+    """
+
+    def __init__(self, south, west, north, east, width_px, height_px,
+                 rotation_deg=0.0):
+        self.south, self.west, self.north, self.east = south, west, north, east
+        self.width_px, self.height_px = int(width_px), int(height_px)
+        self.rotation_deg = float(rotation_deg or 0.0)
+        self.cy = (south + north) / 2.0
+        self.cx = (west + east) / 2.0
+        # Local metres-per-degree at the box centre.
+        self.m_lat = 110540.0
+        self.m_lon = 111320.0 * math.cos(math.radians(self.cy))
+        self.w_m = (east - west) * self.m_lon
+        self.h_m = (north - south) * self.m_lat
+        t = math.radians(self.rotation_deg)
+        self._cos, self._sin = math.cos(t), math.sin(t)
+
+    @property
+    def is_rotated(self):
+        return abs(self.rotation_deg) > 1e-9
+
+    def pixel_to_lonlat(self, x, y):
+        u = (x / self.width_px - 0.5) * self.w_m    # metres along box width
+        v = (y / self.height_px - 0.5) * self.h_m   # metres down box height
+        east_m = u * self._cos + v * self._sin
+        north_m = u * self._sin - v * self._cos
+        return (self.cx + east_m / self.m_lon, self.cy + north_m / self.m_lat)
+
+    def lonlat_to_pixel(self, lon, lat):
+        east_m = (lon - self.cx) * self.m_lon
+        north_m = (lat - self.cy) * self.m_lat
+        # The rotation matrix [[c, s], [s, -c]] is an involution (its own
+        # inverse), so the same coefficients map world back to box frame.
+        u = east_m * self._cos + north_m * self._sin
+        v = east_m * self._sin - north_m * self._cos
+        px = int((u / self.w_m + 0.5) * self.width_px)
+        py = int((v / self.h_m + 0.5) * self.height_px)
+        return (px, py)
+
+    def aabb(self):
+        """(south, west, north, east) of the box that covers the rotated
+        selection — what geographic data queries (DEM, Overpass, shapefile
+        clips) must fetch."""
+        if not self.is_rotated:
+            return (self.south, self.west, self.north, self.east)
+        corners = [
+            self.pixel_to_lonlat(x, y)
+            for (x, y) in ((0, 0), (self.width_px, 0), (0, self.height_px),
+                           (self.width_px, self.height_px))
+        ]
+        lons = [c[0] for c in corners]
+        lats = [c[1] for c in corners]
+        return (min(lats), min(lons), max(lats), max(lons))
+
+    def affine(self):
+        """rasterio Affine mapping pixel (col, row) -> (lon, lat), including
+        the rotation — used as dst_transform so the DEM is resampled directly
+        onto the rotated grid."""
+        from rasterio.transform import Affine
+        a = (self.w_m / self.width_px) * self._cos / self.m_lon
+        b = (self.h_m / self.height_px) * self._sin / self.m_lon
+        d = (self.w_m / self.width_px) * self._sin / self.m_lat
+        e = -(self.h_m / self.height_px) * self._cos / self.m_lat
+        c = self.cx - a * self.width_px / 2.0 - b * self.height_px / 2.0
+        f = self.cy - d * self.width_px / 2.0 - e * self.height_px / 2.0
+        return Affine(a, b, c, d, e, f)
+
+
 class MapProcessor:
     """Processes DEM data and generates styled terrain maps."""
     
@@ -148,22 +228,33 @@ class MapProcessor:
     
     def generate(self, name: str, south: float, west: float, north: float, east: float,
                  width_px: int, height_px: int, dem_source: str = 'COP90',
-                 plains_frac: float = None, highland_frac: float = None) -> dict:
+                 plains_frac: float = None, highland_frac: float = None,
+                 rotation_deg: float = 0.0) -> dict:
         """
         Generate a styled terrain map.
-        
+
         Args:
             name: Map name
             south, west, north, east: Bounding box in WGS84
             dem_source: DEM source ('COP30', 'COP90', 'SRTM15+')
-        
+            rotation_deg: rotate the selection box CCW about its center; the
+                output image's x axis runs along the rotated box's width.
+
         Returns:
             dict with file paths and metadata
         """
         print(f"Generating map: {name}")
         print(f"Bounds: S={south}, W={west}, N={north}, E={east}")
+        if rotation_deg:
+            print(f"Rotation: {rotation_deg} deg")
         print(f"DEM Source: {dem_source}")
         print(f"Output size: {width_px} x {height_px} px (total: {width_px * height_px:,} px)")
+
+        # All pixel<->geo mapping goes through the grid so rotated selections
+        # stay consistent across the DEM, water overlays, spawns, and depth.
+        grid = GeoGrid(south, west, north, east, width_px, height_px, rotation_deg)
+        # Geographic data queries must cover the whole rotated box.
+        (q_south, q_west, q_north, q_east) = grid.aabb()
 
         area_deg2 = abs((north - south) * (east - west))
 
@@ -176,20 +267,22 @@ class MapProcessor:
         print("Downloading DEM...")
         dem_source_requested = dem_source
         dem_path, dem_source_used = self._download_dem(
-            south, west, north, east, dem_source
+            q_south, q_west, q_north, q_east, dem_source
         )
-        
+
         # Step 2: Load and process DEM
         print("Processing DEM...")
-        dem_array, dem_transform, dem_crs = self._load_dem(dem_path, width_px, height_px)
-        
+        dem_array, dem_transform, dem_crs = self._load_dem(
+            dem_path, width_px, height_px, grid=grid
+        )
+
         # Step 3: Apply color palette
         print("Applying color palette...")
         styled_image = self._apply_palette(
             dem_array, dynamic_scale=True,
             plains_frac=plains_frac, highland_frac=highland_frac,
         )
-        
+
         # Step 4: Overlay water features. Small/zoomed-in areas use detailed
         # OpenStreetMap data (real rivers/lakes); large areas use Natural Earth
         # (Overpass would be too heavy). Fall back to NE if OSM yields nothing.
@@ -198,14 +291,16 @@ class MapProcessor:
         if area_deg2 <= OSM_MAX_AREA_DEG2:
             try:
                 drawn = self._add_osm_water(
-                    styled_image, south, west, north, east, width_px, height_px
+                    styled_image, south, west, north, east, width_px, height_px,
+                    grid=grid,
                 )
                 used_osm = drawn > 0
             except Exception as e:
                 print(f"OSM water failed, falling back to Natural Earth: {e}")
         if not used_osm:
             styled_image = self._add_water_features(
-                styled_image, south, west, north, east, width_px, height_px
+                styled_image, south, west, north, east, width_px, height_px,
+                grid=grid,
             )
 
         # Re-apply the terrain mix over the FINAL land (after rivers), so the
@@ -223,7 +318,7 @@ class MapProcessor:
         extra_names = []
         try:
             points = self._get_province_points(
-                south, west, north, east, width_px, height_px
+                south, west, north, east, width_px, height_px, grid=grid
             )
         except Exception as e:
             print(f"Warning: admin nation detection failed: {e}")
@@ -232,14 +327,14 @@ class MapProcessor:
             try:
                 points += self._get_osm_place_points(
                     south, west, north, east, width_px, height_px,
-                    NATION_TARGET - len(points), points,
+                    NATION_TARGET - len(points), points, grid=grid,
                 )
             except Exception as e:
                 print(f"Warning: OSM place spawns failed: {e}")
             if len(points) < NATION_MIN:
                 try:
                     extra_names = self._get_nearby_place_names(
-                        south, west, north, east, points,
+                        q_south, q_west, q_north, q_east, points,
                         NATION_MIN - len(points) + 10,
                     )
                 except Exception as e:
@@ -272,6 +367,7 @@ class MapProcessor:
                 "east": east
             },
             "origin": "top-left",
+            "rotation_deg": rotation_deg,
             "dem_source_requested": dem_source_requested,
             "dem_source_used": dem_source_used,
             "points": points
@@ -287,8 +383,12 @@ class MapProcessor:
         depth_array = None
         try:
             print("Fetching bathymetry (GEBCO) for water depth...")
-            bathy_path, _ = self._download_dem(south, west, north, east, "GEBCOIceTopo")
-            bathy_dem, _, _ = self._load_dem(bathy_path, width_px, height_px)
+            bathy_path, _ = self._download_dem(
+                q_south, q_west, q_north, q_east, "GEBCOIceTopo"
+            )
+            bathy_dem, _, _ = self._load_dem(
+                bathy_path, width_px, height_px, grid=grid
+            )
             depth_array = np.maximum(0.0, -bathy_dem.astype(np.float32))
             if os.path.exists(bathy_path):
                 os.remove(bathy_path)
@@ -489,8 +589,13 @@ class MapProcessor:
             for s in srcs:
                 s.close()
     
-    def _load_dem(self, dem_path: str, target_width: int, target_height: int) -> tuple:
+    def _load_dem(self, dem_path: str, target_width: int, target_height: int,
+                  grid: "GeoGrid" = None) -> tuple:
         """Load DEM and resample to target size.
+
+        When a (rotated) GeoGrid is supplied, the DEM is resampled directly
+        onto the rotated pixel grid via its affine transform, so the output
+        image's axes run along the rotated selection box.
 
         Handles two things a naive resample gets wrong:
         - NoData: LiDAR products (USGS 3DEP) contain voids (project seams,
@@ -504,14 +609,18 @@ class MapProcessor:
           average resampling when downsampling so all the detail contributes.
         """
         with rasterio.open(dem_path) as src:
-            # Calculate new transform for target size
-            transform_new, width_new, height_new = calculate_default_transform(
-                src.crs, src.crs,
-                src.width, src.height,
-                *src.bounds,
-                dst_width=target_width,
-                dst_height=target_height
-            )
+            if grid is not None:
+                # Resample straight onto the (possibly rotated) selection grid.
+                transform_new = grid.affine()
+            else:
+                # Calculate new transform for target size
+                transform_new, width_new, height_new = calculate_default_transform(
+                    src.crs, src.crs,
+                    src.width, src.height,
+                    *src.bounds,
+                    dst_width=target_width,
+                    dst_height=target_height
+                )
 
             # Average when downsampling significantly (fine source -> coarse
             # output), bilinear when at similar scale or upsampling.
@@ -702,7 +811,8 @@ class MapProcessor:
         return None
 
     def _add_osm_water(self, image: Image.Image, south: float, west: float,
-                       north: float, east: float, width: int, height: int) -> int:
+                       north: float, east: float, width: int, height: int,
+                       grid: "GeoGrid" = None) -> int:
         """Overlay real rivers/lakes from OpenStreetMap (Overpass) onto the image.
 
         Returns the number of water features drawn (0 if none / on failure), so
@@ -710,8 +820,14 @@ class MapProcessor:
         """
         from PIL import ImageDraw
 
+        if grid is None:
+            grid = GeoGrid(south, west, north, east, width, height)
+
         water_color = (0, 0, 106)
-        bbox = f"{south},{west},{north},{east}"
+        # Query the AABB of the (possibly rotated) selection; features outside
+        # the rotated box map to off-image pixels and are clipped by PIL.
+        (q_s, q_w, q_n, q_e) = grid.aabb()
+        bbox = f"{q_s},{q_w},{q_n},{q_e}"
         # For larger areas, keep only major waterways so Overpass stays fast;
         # lakes (natural=water) are always included so real lakes are captured.
         area_deg2 = abs((north - south) * (east - west))
@@ -739,10 +855,7 @@ class MapProcessor:
 
         draw = ImageDraw.Draw(image)
 
-        def to_px(lon, lat):
-            px = int((lon - west) / (east - west) * width)
-            py = int((north - lat) / (north - south) * height)
-            return (px, py)
+        to_px = grid.lonlat_to_pixel
 
         river_w = max(2, width // 400)
         small_w = max(1, width // 900)
@@ -821,42 +934,46 @@ class MapProcessor:
         return drawn
 
     def _add_water_features(self, image: Image.Image, south: float, west: float,
-                            north: float, east: float, width: int, height: int) -> Image.Image:
+                            north: float, east: float, width: int, height: int,
+                            grid: "GeoGrid" = None) -> Image.Image:
         """Add rivers and lakes to the image."""
-        
+
+        if grid is None:
+            grid = GeoGrid(south, west, north, east, width, height)
+
         # Water color from palette
         water_color = (0, 0, 106, 255)  # Ocean blue
-        
+
+        # Clip shapefiles to the AABB of the (possibly rotated) selection;
+        # geometry outside the rotated box lands off-image and PIL clips it.
+        (q_s, q_w, q_n, q_e) = grid.aabb()
+
         # Try to get Natural Earth data
         try:
             # Download and cache rivers/lakes shapefiles
             rivers_path = self._get_ne_shapefile(NE_RIVERS_URL, 'rivers')
             lakes_path = self._get_ne_shapefile(NE_LAKES_URL, 'lakes')
-            
+
             if rivers_path or lakes_path:
                 from PIL import ImageDraw
                 draw = ImageDraw.Draw(image)
-                
-                # Coordinate transform function
-                def world_to_pixel(lon, lat):
-                    px = int((lon - west) / (east - west) * width)
-                    py = int((north - lat) / (north - south) * height)
-                    return (px, py)
-                
+
+                world_to_pixel = grid.lonlat_to_pixel
+
                 # Draw lakes
                 if lakes_path:
-                    self._draw_polygons(draw, lakes_path, south, west, north, east,
+                    self._draw_polygons(draw, lakes_path, q_s, q_w, q_n, q_e,
                                        world_to_pixel, water_color[:3])
-                
+
                 # Draw rivers
                 if rivers_path:
                     river_width = max(1, int(width / 1000))
-                    self._draw_lines(draw, rivers_path, south, west, north, east,
+                    self._draw_lines(draw, rivers_path, q_s, q_w, q_n, q_e,
                                     world_to_pixel, water_color[:3], river_width)
-        
+
         except Exception as e:
             print(f"Warning: Could not add water features: {e}")
-        
+
         return image
     
     def _get_ne_shapefile(self, url: str, name: str) -> str:
@@ -1029,23 +1146,25 @@ class MapProcessor:
         return out
 
     def _get_osm_place_points(self, south, west, north, east, width, height,
-                              need, existing):
+                              need, existing, grid: "GeoGrid" = None):
         """In-bbox OSM place names as nation spawns (with real coordinates).
 
         Returns up to `need` points {name, flag, pixel_x, pixel_y}, skipping
         names already present in `existing`.
         """
+        if grid is None:
+            grid = GeoGrid(south, west, north, east, width, height)
+        (q_s, q_w, q_n, q_e) = grid.aabb()
         flag = self._dominant_flag(existing)
         used = {p.get("name", "").lower() for p in existing}
         points = []
-        for pl in self._osm_places(south, west, north, east):
+        for pl in self._osm_places(q_s, q_w, q_n, q_e):
             if len(points) >= need:
                 break
             nm = pl["name"]
             if nm.lower() in used:
                 continue
-            px = int((pl["lon"] - west) / (east - west) * width)
-            py = int((north - pl["lat"]) / (north - south) * height)
+            px, py = grid.lonlat_to_pixel(pl["lon"], pl["lat"])
             if px < 0 or px >= width or py < 0 or py >= height:
                 continue
             used.add(nm.lower())
@@ -1085,16 +1204,18 @@ class MapProcessor:
         return names
 
     def _get_province_points(self, south: float, west: float, north: float, east: float,
-                             width: int, height: int, max_provinces: int = 20) -> list:
+                             width: int, height: int, max_provinces: int = 20,
+                             grid: "GeoGrid" = None) -> list:
         """Get province/country center points."""
-        
+
+        if grid is None:
+            grid = GeoGrid(south, west, north, east, width, height)
+        (south, west, north, east) = grid.aabb()
+
         points = []
-        
-        def world_to_pixel(lon, lat):
-            px = int((lon - west) / (east - west) * width)
-            py = int((north - lat) / (north - south) * height)
-            return (px, py)
-        
+
+        world_to_pixel = grid.lonlat_to_pixel
+
         try:
             # Try countries first (for world/continent maps)
             admin0_path = self._get_ne_shapefile(NE_ADMIN0_URL, 'admin0')
@@ -1103,7 +1224,7 @@ class MapProcessor:
                     admin0_path, south, west, north, east, world_to_pixel,
                     name_fields=['NAME', 'NAME_EN', 'ADMIN'],
                     flag_fields=['ISO_A2', 'ISO_A2_EH'],
-                    is_country=True
+                    is_country=True, width=width, height=height
                 )
                 
                 if len(country_points) >= 3:
@@ -1122,7 +1243,7 @@ class MapProcessor:
                         admin1_path, south, west, north, east, world_to_pixel,
                         name_fields=['name', 'name_en', 'name_1'],
                         flag_fields=['iso_3166_2', 'adm1_code'],
-                        is_country=False
+                        is_country=False, width=width, height=height
                     )
                     points = sorted(province_points, key=lambda x: x.get('area', 0), reverse=True)
                     points = points[:max_provinces]
@@ -1144,7 +1265,8 @@ class MapProcessor:
     def _extract_points_from_shapefile(self, shp_path: str, south: float, west: float,
                                         north: float, east: float, world_to_pixel,
                                         name_fields: list, flag_fields: list,
-                                        is_country: bool) -> list:
+                                        is_country: bool, width: int = None,
+                                        height: int = None) -> list:
         """Extract center points from a shapefile."""
         
         points = []
@@ -1196,11 +1318,15 @@ class MapProcessor:
                         
                         # Calculate pixel coords
                         px, py = world_to_pixel(center.x, center.y)
-                        
-                        # Skip if outside image bounds
-                        if px < 0 or px >= world_to_pixel(east, south)[0]:
+
+                        # Skip if outside image bounds. (For rotated grids the
+                        # old corner-derived bounds trick is wrong; use the
+                        # actual image dimensions.)
+                        max_x = width if width else world_to_pixel(east, south)[0]
+                        max_y = height if height else world_to_pixel(west, south)[1]
+                        if px < 0 or px >= max_x:
                             continue
-                        if py < 0 or py >= world_to_pixel(west, south)[1]:
+                        if py < 0 or py >= max_y:
                             continue
                         
                         # Estimate area
