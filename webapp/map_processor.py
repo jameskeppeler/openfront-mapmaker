@@ -270,11 +270,41 @@ class MapProcessor:
             q_south, q_west, q_north, q_east, dem_source
         )
 
-        # Step 2: Load and process DEM
+        # Step 2: Load and process DEM. Nodata is left as NaN here because its
+        # meaning depends on the product: land-only DEMs (USGS 3DEP) use nodata
+        # for the ocean and large water bodies as well as project-seam voids.
         print("Processing DEM...")
         dem_array, dem_transform, dem_crs = self._load_dem(
-            dem_path, width_px, height_px, grid=grid
+            dem_path, width_px, height_px, grid=grid, fill_nodata=False
         )
+
+        # Blend a global, fully-covered DEM into any nodata cells so seams get
+        # REAL terrain and the ocean gets REAL sea level (Copernicus is 0 over
+        # ocean -> water). This is what makes land-only LiDAR products usable:
+        # no guessing which voids are water and which are gaps.
+        nan_mask = ~np.isfinite(dem_array)
+        if nan_mask.any():
+            n_nan = int(nan_mask.sum())
+            blend_source = 'COP30' if dem_source_used != 'COP30' else 'COP90'
+            print(f"DEM has {n_nan} nodata cell(s) "
+                  f"({100.0 * n_nan / nan_mask.size:.1f}%); blending "
+                  f"{blend_source} into the gaps...")
+            try:
+                blend_path, _ = self._download_dem(
+                    q_south, q_west, q_north, q_east, blend_source
+                )
+                blend_dem, _, _ = self._load_dem(
+                    blend_path, width_px, height_px, grid=grid, fill_nodata=True
+                )
+                dem_array = np.where(nan_mask, blend_dem, dem_array)
+                if os.path.exists(blend_path):
+                    os.remove(blend_path)
+            except Exception as e:
+                # Last resort: nodata becomes sea level (water) — never fake
+                # terrain invented from neighbouring cells.
+                print(f"Blend DEM unavailable ({e}); "
+                      f"treating nodata as water")
+                dem_array = np.where(nan_mask, -1.0, dem_array)
 
         # Step 3: Apply color palette
         print("Applying color palette...")
@@ -590,7 +620,7 @@ class MapProcessor:
                 s.close()
     
     def _load_dem(self, dem_path: str, target_width: int, target_height: int,
-                  grid: "GeoGrid" = None) -> tuple:
+                  grid: "GeoGrid" = None, fill_nodata: bool = True) -> tuple:
         """Load DEM and resample to target size.
 
         When a (rotated) GeoGrid is supplied, the DEM is resampled directly
@@ -598,11 +628,17 @@ class MapProcessor:
         image's axes run along the rotated selection box.
 
         Handles two things a naive resample gets wrong:
-        - NoData: LiDAR products (USGS 3DEP) contain voids (project seams,
-          water, gaps). Without masking, those sentinel values (-999999 or
-          +3.4e38) leak into the elevation stretch and render as bogus
-          max-height "mountains" (white blotches) or false water. NoData and
-          absurd values are masked and filled from the nearest valid cell.
+        - NoData: sentinel values (-999999 / +3.4e38) must never leak into the
+          elevation stretch (they render as bogus max-height "mountains").
+          They are always masked; what replaces them depends on `fill_nodata`:
+          * fill_nodata=True — fill from the nearest valid cell. Correct for
+            global, fully-covered sources (GEBCO/Copernicus) whose nodata is
+            incidental.
+          * fill_nodata=False — leave NaN and let the CALLER decide. Required
+            for land-only products (USGS 3DEP), where nodata *means* "not
+            land" (ocean, large water bodies) as well as project-seam voids;
+            the caller blends a global DEM into the NaN cells so voids get
+            real terrain and the ocean gets real sea level.
         - Downsampling quality: high-res sources (1m LiDAR) are typically
           downsampled 10-100x to the output size. Bilinear only samples a 2x2
           neighbourhood, skipping most of the source data (aliasing); use
@@ -644,21 +680,26 @@ class MapProcessor:
             # sentinels that slipped through, e.g. +/-3.4e38 or -999999).
             invalid = ~np.isfinite(data) | (np.abs(data) > 12000)
             n_invalid = int(invalid.sum())
-            if n_invalid and n_invalid < data.size:
-                # Fill voids from the nearest valid cell so LiDAR gaps render
-                # as plausible terrain instead of white blotches.
-                try:
-                    from scipy.ndimage import distance_transform_edt
-                    idx = distance_transform_edt(
-                        invalid, return_distances=False, return_indices=True
-                    )
-                    data = data[tuple(idx)]
-                    print(f"DEM: filled {n_invalid} nodata cell(s) "
-                          f"({100.0 * n_invalid / data.size:.1f}%) from nearest valid")
-                except ImportError:
-                    data = np.where(invalid, 0.0, data)
-            elif n_invalid == data.size:
+            if n_invalid == data.size:
                 raise Exception("DEM contains no valid elevation data")
+            if n_invalid:
+                data[invalid] = np.nan
+                if fill_nodata:
+                    try:
+                        from scipy.ndimage import distance_transform_edt
+                        idx = distance_transform_edt(
+                            invalid, return_distances=False, return_indices=True
+                        )
+                        data = data[tuple(idx)]
+                        print(f"DEM: filled {n_invalid} nodata cell(s) "
+                              f"({100.0 * n_invalid / data.size:.1f}%) from "
+                              f"nearest valid")
+                    except ImportError:
+                        data = np.where(invalid, 0.0, data)
+                else:
+                    print(f"DEM: {n_invalid} nodata cell(s) "
+                          f"({100.0 * n_invalid / data.size:.1f}%) left for "
+                          f"caller to blend")
 
             return data, transform_new, src.crs
     
@@ -715,9 +756,29 @@ class MapProcessor:
             if hi - lo < MIN_RELIEF_M:
                 hi = lo + MIN_RELIEF_M
             norm = np.clip((vals - lo) / (hi - lo), 0.0, 1.0)
-            idx = np.round(norm * (K - 1)).astype(np.int32)
+            # A pure relative stretch fabricates terrain classes: 120m coastal
+            # hills would reach the top of the ramp and render as snow-white
+            # mountain tiles in game. Cap the highest reachable palette index
+            # by what the terrain actually is — the max of:
+            #  - an absolute ceiling: where the region's highest ground falls
+            #    on the palette's own elevation ramp (DEM_COLOR_RAMP: plains
+            #    to 300m, highlands to 1500m, mountains to 5000m), so a high
+            #    plateau (e.g. 4500m with 400m of local relief) still gets
+            #    mountain colors; and
+            #  - a relief ceiling: regions with big local relief read as
+            #    mountainous regardless of absolute height (full alpine range
+            #    at ~2000m of relief).
+            # Within that ceiling the relative stretch keeps local contrast.
+            ramp_elevs = [v for (v, _c, _l) in DEM_COLOR_RAMP if v > 0]
+            abs_ceiling = float(np.interp(hi, ramp_elevs, np.arange(K)))
+            relief = hi - lo
+            relief_ceiling = 9.0 + (K - 1 - 9.0) * min(1.0, relief / 2000.0)
+            ceiling = min(K - 1.0, max(abs_ceiling, relief_ceiling))
+            idx = np.round(norm * ceiling).astype(np.int32)
             print(
-                f"Terrain mix (natural): elevation {lo:.0f}m..{hi:.0f}m stretched"
+                f"Terrain mix (natural): elevation {lo:.0f}m..{hi:.0f}m "
+                f"stretched, palette ceiling {ceiling:.0f}/{K - 1} "
+                f"(absolute {abs_ceiling:.0f}, relief {relief_ceiling:.0f})"
             )
         return np.clip(idx, 0, K - 1)
 
@@ -853,7 +914,12 @@ class MapProcessor:
         if not elements:
             return 0
 
-        draw = ImageDraw.Draw(image)
+        # All water is drawn onto a 1-bit mask first, then composited onto the
+        # image in one pass. This lets multipolygon relations subtract their
+        # inner rings (islands inside bays/lakes stay land) — impossible when
+        # painting water directly over the image.
+        mask = Image.new("L", (image.width, image.height), 0)
+        draw = ImageDraw.Draw(mask)
 
         to_px = grid.lonlat_to_pixel
 
@@ -864,71 +930,83 @@ class MapProcessor:
             pts = [to_px(p["lon"], p["lat"]) for p in geom]
             if len(pts) < 2:
                 return False
-            draw.line(pts, fill=water_color, width=w, joint="curve")
+            draw.line(pts, fill=255, width=w, joint="curve")
             # Round caps at each vertex so sharp bends stay connected.
             r = w // 2
             if r:
                 for (x, y) in pts:
-                    draw.ellipse([x - r, y - r, x + r, y + r], fill=water_color)
+                    draw.ellipse([x - r, y - r, x + r, y + r], fill=255)
             return True
 
         def draw_poly(geom):
             pts = [to_px(p["lon"], p["lat"]) for p in geom]
             if len(pts) < 3:
                 return False
-            draw.polygon(pts, fill=water_color)
+            draw.polygon(pts, fill=255)
             return True
 
-        def draw_relation(el):
-            """Fill a multipolygon water relation.
+        def member_polygons(el, role):
+            """Stitch a relation's member ways of one role into CLOSED rings.
 
-            A lake's outer boundary is often split across many unclosed member
-            ways (e.g. Lake Mainit = 32 segments). Filling each segment on its
-            own produces triangular artifacts, so stitch the outer segments into
-            continuous rings first, then fill each ring.
+            Members arrive as arbitrary unordered segments (a bay outer
+            boundary can be hundreds of ways). polygonize() yields only valid
+            closed rings; open leftovers are dropped entirely — filling them
+            produces the triangular spike / perimeter-ring artifacts.
             """
+            from shapely.ops import polygonize
             lines = []
             for m in el.get("members", []):
-                if m.get("role") == "outer" and m.get("geometry"):
+                if m.get("role") == role and m.get("geometry"):
                     coords = [(p["lon"], p["lat"]) for p in m["geometry"]]
                     if len(coords) >= 2:
                         lines.append(LineString(coords))
             if not lines:
-                return 0
+                return []
             try:
                 merged = linemerge(unary_union(lines))
+                return [list(p.exterior.coords) for p in polygonize(merged)]
             except Exception:
-                merged = None
-            if merged is None or merged.is_empty:
-                rings = [list(l.coords) for l in lines]
-            elif merged.geom_type == "MultiLineString":
-                rings = [list(g.coords) for g in merged.geoms]
-            else:
-                rings = [list(merged.coords)]
+                return []
+
+        def draw_relation(el):
+            """Fill a multipolygon water relation: outer rings become water,
+            inner rings (islands) are punched back out of the mask."""
+            outers = member_polygons(el, "outer")
             n = 0
-            for ring in rings:
+            for ring in outers:
                 pts = [to_px(x, y) for (x, y) in ring]
                 if len(pts) >= 3:
-                    draw.polygon(pts, fill=water_color)
+                    draw.polygon(pts, fill=255)
                     n += 1
+            if n:
+                for ring in member_polygons(el, "inner"):
+                    pts = [to_px(x, y) for (x, y) in ring]
+                    if len(pts) >= 3:
+                        draw.polygon(pts, fill=0)
             return n
 
         drawn = 0
+        # Relations first, ways after, so a small closed water way (pond on an
+        # island) isn't erased by its surrounding relation's inner ring.
         for el in elements:
-            etype = el.get("type")
-            tags = el.get("tags", {}) or {}
-            if etype == "way":
-                geom = el.get("geometry")
-                if not geom:
-                    continue
-                if tags.get("waterway"):
-                    w = river_w if tags.get("waterway") == "river" else small_w
-                    if draw_line(geom, w):
-                        drawn += 1
-                elif draw_poly(geom):
-                    drawn += 1
-            elif etype == "relation":
+            if el.get("type") == "relation":
                 drawn += draw_relation(el)
+        for el in elements:
+            if el.get("type") != "way":
+                continue
+            tags = el.get("tags", {}) or {}
+            geom = el.get("geometry")
+            if not geom:
+                continue
+            if tags.get("waterway"):
+                w = river_w if tags.get("waterway") == "river" else small_w
+                if draw_line(geom, w):
+                    drawn += 1
+            elif draw_poly(geom):
+                drawn += 1
+
+        # Composite the water mask onto the image in one pass.
+        image.paste(water_color + (255,), mask=mask)
 
         print(f"OSM water: drew {drawn} feature(s) from {len(elements)} element(s)")
         return drawn
