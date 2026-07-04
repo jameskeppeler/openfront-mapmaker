@@ -345,7 +345,7 @@ class MapProcessor:
                 print(f"Using {dem_source} LiDAR for this area.")
                 return path, dem_source
             except NoCoverageError as e:
-                print(f"No {dem_source} LiDAR coverage for this area ({e}); "
+                print(f"{dem_source} LiDAR unavailable ({e}); "
                       f"falling back to {DEM_FALLBACK_SOURCE}.")
                 path = self._download_dem_source(
                     south, west, north, east, DEM_FALLBACK_SOURCE
@@ -448,17 +448,27 @@ class MapProcessor:
             print(f"OpenTopography rejected area as too large: {text}")
             return None
 
-        # USGS 3DEP LiDAR only covers parts of the US. An out-of-coverage
-        # request comes back as an error / "no data" rather than a too-large
-        # rejection; signal the caller to fall back to a global source.
-        no_coverage = dem_source in LIDAR_SOURCES and (
-            response.status_code in (204, 404)
-            or any(kw in low for kw in ("no data", "not available", "no dem",
-                                        "outside", "coverage", "not found"))
-            or not response.content
-        )
-        if no_coverage:
-            raise NoCoverageError(f"{response.status_code}: {text[:120]}")
+        # USGS 3DEP LiDAR is fallback-eligible in two cases: no coverage for
+        # the area (it only covers parts of the US), or access denied —
+        # OpenTopography restricts the 1m dataset to academic accounts, and
+        # 10m/30m still need a valid (free) API key. Either way the map can
+        # still be made from a global source, so signal the caller to fall
+        # back rather than failing the whole generation.
+        if dem_source in LIDAR_SOURCES:
+            if response.status_code in (401, 403):
+                raise NoCoverageError(
+                    f"access denied (HTTP {response.status_code}) — USGS 1m "
+                    f"requires an academic OpenTopography account; 10m/30m "
+                    f"need a valid free API key"
+                )
+            no_coverage = (
+                response.status_code in (204, 404)
+                or any(kw in low for kw in ("no data", "not available", "no dem",
+                                            "outside", "coverage", "not found"))
+                or not response.content
+            )
+            if no_coverage:
+                raise NoCoverageError(f"{response.status_code}: {text[:120]}")
 
         raise Exception(f"Failed to download DEM: {response.status_code} - {text}")
 
