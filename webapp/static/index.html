@@ -512,6 +512,15 @@
                     </div>
 
                     <div class="form-group">
+                        <label class="form-label">Output Size</label>
+                        <select id="outputSize" class="form-select" onchange="refreshResolutionInfo()">
+                            <option value="3000000" selected>Standard (3 MP)</option>
+                            <option value="6000000">High (6 MP — slower to generate)</option>
+                            <option value="8000000">Max (8 MP — largest official map size)</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
                         <label class="form-label" style="display:flex; align-items:center; gap:8px; cursor:pointer;">
                             <input type="checkbox" id="customTerrainToggle" onchange="toggleTerrainMix()" style="width:auto; cursor:pointer;">
                             ⚙️ Advanced: custom terrain mix
@@ -948,9 +957,7 @@
             document.getElementById('boundWest').textContent = currentBounds.west.toFixed(4);
             document.getElementById('boundEast').textContent = currentBounds.east.toFixed(4);
             
-            // Calculate resolution (max 3M pixels)
-            const resolution = calculateResolution(currentBounds);
-            document.getElementById('resolutionDisplay').textContent = `${resolution.width} × ${resolution.height} px`;
+            refreshResolutionInfo();
 
             document.getElementById('noBoundsText').classList.add('hidden');
             document.getElementById('boundsDisplay').classList.remove('hidden');
@@ -981,6 +988,14 @@
             const msgs = [];
             if (isLidar) {
                 msgs.push('🛰️ USGS 3DEP LiDAR is US-only — toggle the "USGS LiDAR coverage (US)" overlay to confirm your area has data. Outside coverage it falls back to Copernicus 30m automatically.');
+                // The output pixel size caps visible detail regardless of the
+                // source: 1m data at 20 m/px looks like a 20m DEM. Tell the
+                // user how much LiDAR detail this selection can actually show.
+                const srcRes = dem === 'USGS1m' ? 1 : 10;
+                const mpp = metersPerPixel(currentBounds, calculateResolution(currentBounds));
+                if (mpp > srcRes * 4) {
+                    msgs.push(`📏 At this size the map renders at ~${Math.round(mpp)} m/px, so most of the ${srcRes}m LiDAR detail can't show. For true HD terrain, draw a much smaller area (aim for ~${srcRes}–${srcRes * 3} m/px).`);
+                }
             }
             if (isLidar && dem === 'USGS1m' && areaDeg2 > 0.25) {
                 msgs.push('⚠️ 1m LiDAR over this area is very large and slow — consider a smaller area or USGS 10m.');
@@ -1017,8 +1032,33 @@
             document.getElementById('mountainPct').textContent = Math.max(0, Math.round(100 - p - h));
         }
         
+        // Recompute the resolution readout (+ notices) for the current
+        // selection — called when the rectangle, DEM source, or output size
+        // changes, so the px / m-per-px numbers always reflect what Generate
+        // will actually produce.
+        function refreshResolutionInfo() {
+            if (!currentBounds) return;
+            const resolution = calculateResolution(currentBounds);
+            const mpp = metersPerPixel(currentBounds, resolution);
+            document.getElementById('resolutionDisplay').textContent =
+                `${resolution.width} × ${resolution.height} px (~${mpp < 10 ? mpp.toFixed(1) : Math.round(mpp)} m/px)`;
+            updateAreaNotice();
+        }
+
+        // Ground size of one output pixel (metres). This is what actually
+        // bounds visible detail: a 1m LiDAR source shown at 20 m/px looks like
+        // any 20m DEM — the output resolution is the ceiling, not the source.
+        function metersPerPixel(bounds, resolution) {
+            const heightMeters = (bounds.north - bounds.south) * 111320;
+            return heightMeters / Math.max(1, resolution.height);
+        }
+
         function calculateResolution(bounds) {
-            const MAX_PIXELS = 3000000; // 3 million pixels
+            // Cap from the Output Size selector. The ceiling (8 MP) matches the
+            // largest official map (Giant World Map, 4108x1948) — proven safe
+            // in the game; bigger maps just generate and load more slowly.
+            const sel = document.getElementById('outputSize');
+            const MAX_PIXELS = sel ? parseInt(sel.value, 10) : 3000000;
             
             // Calculate aspect ratio with latitude correction
             const centerLat = (bounds.north + bounds.south) / 2;

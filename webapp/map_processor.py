@@ -480,8 +480,19 @@ class MapProcessor:
                 s.close()
     
     def _load_dem(self, dem_path: str, target_width: int, target_height: int) -> tuple:
-        """Load DEM and resample to target size."""
-        
+        """Load DEM and resample to target size.
+
+        Handles two things a naive resample gets wrong:
+        - NoData: LiDAR products (USGS 3DEP) contain voids (project seams,
+          water, gaps). Without masking, those sentinel values (-999999 or
+          +3.4e38) leak into the elevation stretch and render as bogus
+          max-height "mountains" (white blotches) or false water. NoData and
+          absurd values are masked and filled from the nearest valid cell.
+        - Downsampling quality: high-res sources (1m LiDAR) are typically
+          downsampled 10-100x to the output size. Bilinear only samples a 2x2
+          neighbourhood, skipping most of the source data (aliasing); use
+          average resampling when downsampling so all the detail contributes.
+        """
         with rasterio.open(dem_path) as src:
             # Calculate new transform for target size
             transform_new, width_new, height_new = calculate_default_transform(
@@ -491,9 +502,13 @@ class MapProcessor:
                 dst_width=target_width,
                 dst_height=target_height
             )
-            
-            # Resample
-            data = np.empty((target_height, target_width), dtype=np.float32)
+
+            # Average when downsampling significantly (fine source -> coarse
+            # output), bilinear when at similar scale or upsampling.
+            scale = src.width / max(1, target_width)
+            resampling = Resampling.average if scale > 2 else Resampling.bilinear
+
+            data = np.full((target_height, target_width), np.nan, dtype=np.float32)
             reproject(
                 source=rasterio.band(src, 1),
                 destination=data,
@@ -501,9 +516,31 @@ class MapProcessor:
                 src_crs=src.crs,
                 dst_transform=transform_new,
                 dst_crs=src.crs,
-                resampling=Resampling.bilinear
+                src_nodata=src.nodata,
+                dst_nodata=np.nan,
+                resampling=resampling
             )
-            
+
+            # Mask anything non-finite or physically impossible (nodata
+            # sentinels that slipped through, e.g. +/-3.4e38 or -999999).
+            invalid = ~np.isfinite(data) | (np.abs(data) > 12000)
+            n_invalid = int(invalid.sum())
+            if n_invalid and n_invalid < data.size:
+                # Fill voids from the nearest valid cell so LiDAR gaps render
+                # as plausible terrain instead of white blotches.
+                try:
+                    from scipy.ndimage import distance_transform_edt
+                    idx = distance_transform_edt(
+                        invalid, return_distances=False, return_indices=True
+                    )
+                    data = data[tuple(idx)]
+                    print(f"DEM: filled {n_invalid} nodata cell(s) "
+                          f"({100.0 * n_invalid / data.size:.1f}%) from nearest valid")
+                except ImportError:
+                    data = np.where(invalid, 0.0, data)
+            elif n_invalid == data.size:
+                raise Exception("DEM contains no valid elevation data")
+
             return data, transform_new, src.crs
     
     # Land palette colours (the >0 ramp entries), ordered plains -> peak. Tier
