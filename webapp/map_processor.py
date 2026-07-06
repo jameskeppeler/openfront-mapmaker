@@ -123,12 +123,17 @@ DEM_SOURCES = {
     "SRTM15+":      (GLOBALDEM_URL, "demtype",     "SRTMGL1"),  # legacy alias
     "USGS1m":       (USGSDEM_URL,   "datasetName", "USGS1m"),   # LiDAR, US only
     "USGS10m":      (USGSDEM_URL,   "datasetName", "USGS10m"),  # LiDAR, US only
+    "USGS30m":      (USGSDEM_URL,   "datasetName", "USGS30m"),  # US only
     "GEBCOIceTopo": (GLOBALDEM_URL, "demtype",     "GEBCOIceTopo"),  # bathymetry
 }
-# USGS 3DEP LiDAR sources have limited (US) coverage; when a request lands
-# outside coverage we transparently fall back to this global source.
+# USGS 3DEP sources have limited (US) coverage; when a request lands outside
+# coverage (or can't be downloaded at that resolution for the area) we walk
+# down the resolution ladder and finally fall back to this global source.
 DEM_FALLBACK_SOURCE = "COP30"
-LIDAR_SOURCES = {"USGS1m", "USGS10m"}
+LIDAR_SOURCES = {"USGS1m", "USGS10m", "USGS30m"}
+# Native ground resolution (metres) of the laddered USGS sources, finest first.
+LIDAR_LADDER = ["USGS1m", "USGS10m", "USGS30m"]
+LIDAR_RES_M = {"USGS1m": 1.0, "USGS10m": 10.0, "USGS30m": 30.0}
 
 
 class NoCoverageError(Exception):
@@ -266,8 +271,14 @@ class MapProcessor:
         # Step 1: Download DEM
         print("Downloading DEM...")
         dem_source_requested = dem_source
+        # Ground size of one output pixel — used to pick the coarsest USGS
+        # ladder rung that still saturates the output resolution.
+        effective_mpp = math.sqrt(
+            (grid.w_m * grid.h_m) / max(1, width_px * height_px)
+        )
         dem_path, dem_source_used = self._download_dem(
-            q_south, q_west, q_north, q_east, dem_source
+            q_south, q_west, q_north, q_east, dem_source,
+            effective_mpp=effective_mpp,
         )
 
         # Step 2: Load and process DEM. Nodata is left as NaN here because its
@@ -296,7 +307,21 @@ class MapProcessor:
                 blend_dem, _, _ = self._load_dem(
                     blend_path, width_px, height_px, grid=grid, fill_nodata=True
                 )
-                dem_array = np.where(nan_mask, blend_dem, dem_array)
+                # Noise gate: Copernicus GLO-30 is a radar SURFACE model with
+                # well-known small positive noise over near-shore water (waves,
+                # imperfect water masking). These cells are ones the land-only
+                # primary DEM explicitly declared NOT LAND, so a low blend
+                # value here is water noise, not a real 1-3m coastal strip —
+                # without the gate it renders as ghost land bands offset along
+                # every shoreline. Confident land (above the noise floor)
+                # fills as real terrain.
+                BLEND_NOISE_FLOOR_M = 3.0
+                blend_vals = np.where(
+                    blend_dem > BLEND_NOISE_FLOOR_M,
+                    blend_dem,
+                    np.minimum(blend_dem, 0.0),
+                )
+                dem_array = np.where(nan_mask, blend_vals, dem_array)
                 if os.path.exists(blend_path):
                     os.remove(blend_path)
             except Exception as e:
@@ -447,7 +472,7 @@ class MapProcessor:
         }
     
     def _download_dem(self, south: float, west: float, north: float, east: float,
-                      dem_source: str):
+                      dem_source: str, effective_mpp: float = None):
         """Download DEM from OpenTopography, auto-tiling if the area is too large.
 
         A single request is tried first. If OpenTopography rejects it as too
@@ -455,11 +480,18 @@ class MapProcessor:
         each is fetched recursively, then the tiles are mosaicked into one
         GeoTIFF. This removes the practical area limit at fine detail levels.
 
-        USGS 3DEP LiDAR sources cover only the US; if the area has no LiDAR
-        coverage we transparently fall back to a global source (COP30).
+        USGS 3DEP sources walk a resolution ladder (1m -> 10m -> 30m) instead
+        of failing or jumping straight to a global DEM:
+        - If `effective_mpp` (the output's ground metres-per-pixel) already
+          exceeds a coarser rung's native resolution, the finer rungs are
+          skipped — downloading 1m data for a 15 m/px map buys nothing and
+          costs 100x the transfer.
+        - If a rung has no coverage, is access-denied, or its download is too
+          large even after tiling, the next rung is tried.
+        - Only when the whole ladder fails does it fall back to Copernicus.
 
         Returns (dem_path, source_actually_used) so the caller can tell the user
-        which source produced the map (e.g. whether a LiDAR request fell back).
+        which source produced the map (e.g. whether a request fell back).
         """
         if dem_source not in DEM_SOURCES:
             dem_source = 'COP90'
@@ -467,20 +499,42 @@ class MapProcessor:
         if dem_source in LIDAR_SOURCES:
             area_deg2 = abs((north - south) * (east - west))
             if area_deg2 > OSM_MAX_AREA_DEG2:
-                print(f"Warning: {dem_source} LiDAR over a large area "
+                print(f"Warning: {dem_source} over a large area "
                       f"({area_deg2:.1f} deg^2) will be slow and heavy; "
                       f"it downloads in tiles.")
-            try:
-                path = self._download_dem_source(south, west, north, east, dem_source)
-                print(f"Using {dem_source} LiDAR for this area.")
-                return path, dem_source
-            except NoCoverageError as e:
-                print(f"{dem_source} LiDAR unavailable ({e}); "
-                      f"falling back to {DEM_FALLBACK_SOURCE}.")
-                path = self._download_dem_source(
-                    south, west, north, east, DEM_FALLBACK_SOURCE
-                )
-                return path, DEM_FALLBACK_SOURCE
+
+            ladder = LIDAR_LADDER[LIDAR_LADDER.index(dem_source):] \
+                if dem_source in LIDAR_LADDER else [dem_source]
+
+            # Skip rungs finer than the output can show: the coarsest rung
+            # whose native resolution still saturates the output is the right
+            # starting point (identical output, far smaller download).
+            while (len(ladder) > 1 and effective_mpp
+                   and LIDAR_RES_M[ladder[1]] <= effective_mpp):
+                print(f"Output is ~{effective_mpp:.0f} m/px, which "
+                      f"{ladder[1]} ({LIDAR_RES_M[ladder[1]]:.0f}m) already "
+                      f"saturates — skipping {ladder[0]}.")
+                ladder.pop(0)
+
+            for rung in ladder:
+                try:
+                    path = self._download_dem_source(south, west, north, east, rung)
+                    print(f"Using {rung} for this area.")
+                    return path, rung
+                except NoCoverageError as e:
+                    print(f"{rung} unavailable ({e}); trying next resolution.")
+                except Exception as e:
+                    if "too large" in str(e).lower():
+                        print(f"{rung} download too large for this area ({e}); "
+                              f"trying next resolution.")
+                    else:
+                        raise
+            print(f"All USGS sources unavailable; "
+                  f"falling back to {DEM_FALLBACK_SOURCE}.")
+            path = self._download_dem_source(
+                south, west, north, east, DEM_FALLBACK_SOURCE
+            )
+            return path, DEM_FALLBACK_SOURCE
 
         path = self._download_dem_source(south, west, north, east, dem_source)
         return path, dem_source

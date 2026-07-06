@@ -501,27 +501,24 @@
                     
                     <div class="form-group">
                         <label class="form-label">DEM Source</label>
-                        <select id="demSource" class="form-select" onchange="onDetailSettingsChange()">
+                        <select id="demSource" class="form-select" onchange="refreshResolutionInfo()">
                             <option value="COP90" selected>Copernicus 90m (Recommended)</option>
                             <option value="COP30">Copernicus 30m (High Detail)</option>
                             <option value="SRTMGL1">SRTM 30m (High Detail)</option>
                             <option value="USGS1m">USGS 3DEP 1m LiDAR (US only — highest detail)</option>
                             <option value="USGS10m">USGS 3DEP 10m LiDAR (US only)</option>
+                            <option value="USGS30m">USGS 3DEP 30m (US only)</option>
                         </select>
                         <div id="areaNotice" class="hidden" style="margin-top:8px; font-size:0.8rem; line-height:1.35; color:#fbbf24;"></div>
                     </div>
 
                     <div class="form-group">
                         <label class="form-label">Output Size</label>
-                        <select id="outputSize" class="form-select" onchange="onDetailSettingsChange()">
+                        <select id="outputSize" class="form-select" onchange="refreshResolutionInfo()">
                             <option value="3000000" selected>Standard (3 MP)</option>
                             <option value="6000000">High (6 MP — slower to generate)</option>
                             <option value="8000000">Max (8 MP — largest official map size)</option>
                         </select>
-                        <label class="form-label" style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:8px; font-weight:normal;">
-                            <input type="checkbox" id="detailLockToggle" checked onchange="onDetailSettingsChange()" style="width:auto; cursor:pointer;">
-                            Full-detail lock (limit selection size to the DEM's real resolution)
-                        </label>
                     </div>
 
                     <div class="form-group">
@@ -580,11 +577,13 @@
                             </div>
                         </div>
                         <div style="margin-top:10px;">
-                            <div class="bounds-label" style="display:flex; justify-content:space-between;">
-                                <span>Rotation</span><span id="rotationValue">0°</span>
+                            <div class="bounds-label" style="display:flex; justify-content:space-between; align-items:center;">
+                                <span>Rotation <span id="rotationValue">0°</span></span>
+                                <a onclick="resetRotation()" style="cursor:pointer; color:#22c55e; font-size:0.75rem;">reset</a>
                             </div>
-                            <input type="range" id="rotationSlider" min="-90" max="90" value="0" step="1"
-                                   style="width:100%; cursor:pointer;" oninput="setRotation(this.value)">
+                            <div style="font-size:0.72rem; color:#64748b; margin-top:2px;">
+                                Drag the box to move it, the corners to resize, and the orange ⟳ handle to rotate.
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -925,63 +924,48 @@
                         }
                     }
                 },
+                // Editing happens through the selection's own handles
+                // (drag / corner-resize / rotate), not leaflet-draw's toolbar.
                 edit: {
                     featureGroup: drawnItems,
-                    remove: true
+                    edit: false,
+                    remove: false
                 }
             });
             map.addControl(drawControl);
-            
-            // Handle draw events. Selections are clamped so the chosen DEM's
-            // full detail survives at the chosen output size (see clampToDetail).
+
+            // Initial draw hands the rectangle over to the interactive
+            // selection (movable / resizable / rotatable).
             map.on(L.Draw.Event.CREATED, (e) => {
                 const b = e.layer.getBounds();
-                applySelection({
+                setSelection({
                     south: b.getSouth(), west: b.getWest(),
                     north: b.getNorth(), east: b.getEast(),
                 });
             });
 
-            map.on(L.Draw.Event.EDITED, (e) => {
-                e.layers.eachLayer((layer) => {
-                    const b = layer.getBounds();
-                    applySelection({
-                        south: b.getSouth(), west: b.getWest(),
-                        north: b.getNorth(), east: b.getEast(),
-                    });
-                });
-            });
-            
-            map.on(L.Draw.Event.DELETED, () => {
-                currentBounds = null;
-                document.getElementById('noBoundsText').classList.remove('hidden');
-                document.getElementById('boundsDisplay').classList.add('hidden');
-                document.getElementById('clearBoundsBtn').classList.add('hidden');
-                updateAreaNotice();
-                updateGenerateButton();
-            });
+            // The rotation handle's offset above the box is screen-relative
+            // (~40 px converted to metres at render time), so re-lay it out
+            // when the zoom changes — otherwise zooming out collapses it onto
+            // the box edge (stealing move/resize grabs) and zooming in leaves
+            // it floating far away.
+            map.on('zoomend', () => updateSelectionVisuals());
         }
         
-        function updateBounds(bounds) {
-            currentBounds = {
-                south: bounds.getSouth(),
-                west: bounds.getWest(),
-                north: bounds.getNorth(),
-                east: bounds.getEast()
-            };
-            
+        // Refresh the side-panel readouts from currentBounds (no layer work).
+        function panelRefresh() {
+            if (!currentBounds) return;
             document.getElementById('boundNorth').textContent = currentBounds.north.toFixed(4);
             document.getElementById('boundSouth').textContent = currentBounds.south.toFixed(4);
             document.getElementById('boundWest').textContent = currentBounds.west.toFixed(4);
             document.getElementById('boundEast').textContent = currentBounds.east.toFixed(4);
-            
+            document.getElementById('rotationValue').textContent = `${Math.round(currentRotation)}°`;
+
             refreshResolutionInfo();
-            drawRotatedPreview();
 
             document.getElementById('noBoundsText').classList.add('hidden');
             document.getElementById('boundsDisplay').classList.remove('hidden');
             document.getElementById('clearBoundsBtn').classList.remove('hidden');
-            updateAreaNotice();
             updateGenerateButton();
         }
 
@@ -1002,25 +986,20 @@
                 (currentBounds.east - currentBounds.west)
             );
             const dem = document.getElementById('demSource').value;
-            const isLidar = (dem === 'USGS1m' || dem === 'USGS10m');
+            const isLidar = (dem === 'USGS1m' || dem === 'USGS10m' || dem === 'USGS30m');
             const fine = (dem === 'COP30' || dem === 'SRTMGL1' || isLidar);
             const msgs = [];
-            if (lastClampNote) {
-                msgs.push(lastClampNote);
-            }
             if (isLidar) {
-                msgs.push('🛰️ USGS 3DEP LiDAR is US-only — toggle the "USGS LiDAR coverage (US)" overlay to confirm your area has data. Outside coverage it falls back to Copernicus 30m automatically.');
+                msgs.push('🛰️ USGS 3DEP is US-only — toggle the "USGS LiDAR coverage (US)" overlay to confirm your area has data. Outside coverage it falls back to Copernicus automatically.');
                 // The output pixel size caps visible detail regardless of the
-                // source: 1m data at 20 m/px looks like a 20m DEM. Tell the
-                // user how much LiDAR detail this selection can actually show.
-                const srcRes = dem === 'USGS1m' ? 1 : 10;
+                // source. When the selection is too large for the chosen
+                // resolution, say what the map will ACTUALLY deliver and how
+                // the source ladder behaves — instead of silently degrading.
+                const srcRes = DEM_RES_M[dem] || 30;
                 const mpp = metersPerPixel(currentBounds, calculateResolution(currentBounds));
-                if (mpp > srcRes * 4) {
-                    msgs.push(`📏 At this size the map renders at ~${Math.round(mpp)} m/px, so most of the ${srcRes}m LiDAR detail can't show. For true HD terrain, draw a much smaller area (aim for ~${srcRes}–${srcRes * 3} m/px).`);
+                if (mpp > srcRes * 1.5) {
+                    msgs.push(`📏 This area is too large for full ${srcRes}m detail — the output resolves ~${mpp < 10 ? mpp.toFixed(1) : Math.round(mpp)} m/px. Finer sources than that are skipped automatically (1m → 10m → 30m → Copernicus) since they can't improve the result. Shrink the selection for true ${srcRes}m detail.`);
                 }
-            }
-            if (isLidar && dem === 'USGS1m' && areaDeg2 > 0.25) {
-                msgs.push('⚠️ 1m LiDAR over this area is very large and slow — consider a smaller area or USGS 10m.');
             }
             if (fine && areaDeg2 > 1.0) {
                 msgs.push('⏳ Large area at high detail — the DEM downloads in tiles and is stitched, so this may take a few minutes.');
@@ -1054,102 +1033,203 @@
             document.getElementById('mountainPct').textContent = Math.max(0, Math.round(100 - p - h));
         }
         
-        // ---------- Full-detail selection clamp + rotation ----------
+        // ---------- Interactive selection (move / resize / rotate) ----------
+        //
+        // After the initial leaflet-draw rectangle, the selection is
+        // self-managed: a polygon you can drag to move, square corner handles
+        // to resize, and an orange circular handle above the box to rotate.
+        // All geometry runs in a local metric frame at the box center
+        // (cos-latitude corrected), mirroring the backend GeoGrid math.
 
         // Native ground resolution of each DEM source (metres).
-        const DEM_RES_M = { COP90: 90, COP30: 30, SRTMGL1: 30, USGS1m: 1, USGS10m: 10 };
-        let currentRotation = 0;      // degrees, CCW about the box center
-        let rotatedPreview = null;    // L.polygon showing the rotated selection
-        let lastClampNote = '';       // message shown when a selection was shrunk
+        const DEM_RES_M = { COP90: 90, COP30: 30, SRTMGL1: 30, USGS1m: 1, USGS10m: 10, USGS30m: 30 };
+        let currentRotation = 0;   // degrees, CCW about the box center
+        let sel = null;            // {poly, corners:[4 markers], rotHandle}
+        const MIN_SIZE_M = 300;    // smallest allowed box edge
 
-        // Largest ground area (m^2) whose output pixels still match the DEM's
-        // native resolution: pixels * res^2.
-        function maxDetailAreaM2() {
-            const res = DEM_RES_M[document.getElementById('demSource').value] || 90;
-            const sel = document.getElementById('outputSize');
-            const maxPx = sel ? parseInt(sel.value, 10) : 3000000;
-            return { areaM2: maxPx * res * res, res: res };
-        }
+        const cornerIcon = () => L.divIcon({
+            className: '',
+            html: '<div style="width:12px;height:12px;background:#fff;border:2px solid #22c55e;border-radius:2px;box-shadow:0 1px 3px rgba(0,0,0,0.5);"></div>',
+            iconSize: [12, 12], iconAnchor: [6, 6],
+        });
+        const rotIcon = () => L.divIcon({
+            className: '',
+            html: '<div style="width:18px;height:18px;background:#f59e0b;border:2px solid #fff;border-radius:50%;box-shadow:0 1px 3px rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;font-size:11px;color:#fff;cursor:grab;">⟳</div>',
+            iconSize: [18, 18], iconAnchor: [9, 9],
+        });
 
-        // Shrink bounds around their center so the selection keeps full DEM
-        // detail at the chosen output size. Returns {bounds, clamped}.
-        function clampToDetail(b) {
-            if (!document.getElementById('detailLockToggle')?.checked) {
-                return { bounds: b, clamped: false };
-            }
-            const cLat = (b.north + b.south) / 2;
-            const latC = Math.cos(cLat * Math.PI / 180);
-            const wM = (b.east - b.west) * 111320 * latC;
-            const hM = (b.north - b.south) * 110540;
-            const { areaM2, res } = maxDetailAreaM2();
-            if (wM * hM <= areaM2) return { bounds: b, clamped: false };
-            const s = Math.sqrt(areaM2 / (wM * hM));
-            const cLon = (b.east + b.west) / 2;
-            const halfW = (b.east - b.west) / 2 * s;
-            const halfH = (b.north - b.south) / 2 * s;
-            const nb = { south: cLat - halfH, west: cLon - halfW,
-                         north: cLat + halfH, east: cLon + halfW };
-            const kmW = (wM * s / 1000), kmH = (hM * s / 1000);
-            lastClampNote = `📐 Selection clamped to ~${kmW < 10 ? kmW.toFixed(1) : Math.round(kmW)} × ${kmH < 10 ? kmH.toFixed(1) : Math.round(kmH)} km — the largest area that keeps full ${res}m detail at the chosen output size. Untick "Full-detail lock" to draw bigger.`;
-            return { bounds: nb, clamped: true };
-        }
-
-        // Replace the drawn rectangle with (possibly clamped) bounds and
-        // refresh everything that depends on the selection.
-        function applySelection(b) {
-            const r = clampToDetail(b);
-            if (!r.clamped) lastClampNote = '';
-            drawnItems.clearLayers();
-            const rect = L.rectangle([
-                [r.bounds.south, r.bounds.west],
-                [r.bounds.north, r.bounds.east],
-            ], { color: '#22c55e', weight: 2, fillOpacity: currentRotation ? 0.02 : 0.1, dashArray: currentRotation ? '6 6' : null });
-            drawnItems.addLayer(rect);
-            updateBounds(rect.getBounds());
-        }
-
-        // Corners of the current selection rotated about its center (in the
-        // local metric frame, mirroring the backend GeoGrid math).
-        function rotatedCorners(b, deg) {
+        // Local metric frame of the current selection.
+        function boxFrame(b, deg) {
             const cLat = (b.north + b.south) / 2, cLon = (b.east + b.west) / 2;
             const mLat = 110540, mLon = 111320 * Math.cos(cLat * Math.PI / 180);
             const hw = (b.east - b.west) / 2 * mLon, hh = (b.north - b.south) / 2 * mLat;
-            const t = deg * Math.PI / 180, c = Math.cos(t), s = Math.sin(t);
-            // Box-frame corners (u right, v down) -> world (east, north).
-            return [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(([u, v]) => {
-                const e = u * c + v * s, n = u * s - v * c;
-                return [cLat + n / mLat, cLon + e / mLon];
-            });
+            const t = deg * Math.PI / 180;
+            return { cLat, cLon, mLat, mLon, hw, hh, c: Math.cos(t), s: Math.sin(t) };
+        }
+        // Box frame (u right, v down) -> [lat, lon].
+        function localToWorld(u, v, f) {
+            const e = u * f.c + v * f.s, n = u * f.s - v * f.c;
+            return [f.cLat + n / f.mLat, f.cLon + e / f.mLon];
+        }
+        // [lat, lon] -> box frame (u, v). The rotation matrix is an involution.
+        function worldToLocal(lat, lon, f) {
+            const e = (lon - f.cLon) * f.mLon, n = (lat - f.cLat) * f.mLat;
+            return [e * f.c + n * f.s, e * f.s - n * f.c];
+        }
+        function selectionCorners(f) {
+            return [[-f.hw, -f.hh], [f.hw, -f.hh], [f.hw, f.hh], [-f.hw, f.hh]]
+                .map(([u, v]) => localToWorld(u, v, f));
+        }
+        // Rotation handle sits above the box's top edge, offset by ~40 screen px.
+        function rotHandleLatLng(f) {
+            const cp = map.latLngToContainerPoint([f.cLat, f.cLon]);
+            const up = map.containerPointToLatLng([cp.x, cp.y - 40]);
+            const padM = Math.max(60, (up.lat - f.cLat) * f.mLat);
+            return localToWorld(0, -f.hh - padM, f);
         }
 
-        function drawRotatedPreview() {
-            if (rotatedPreview) { map.removeLayer(rotatedPreview); rotatedPreview = null; }
-            if (!currentBounds || !currentRotation) return;
-            rotatedPreview = L.polygon(rotatedCorners(currentBounds, currentRotation), {
-                color: '#f59e0b', weight: 2, fillOpacity: 0.12, interactive: false,
+        function removeSelection() {
+            if (!sel) return;
+            map.removeLayer(sel.poly);
+            sel.corners.forEach((m) => map.removeLayer(m));
+            map.removeLayer(sel.rotHandle);
+            sel = null;
+        }
+
+        // Reposition existing layers from currentBounds/currentRotation
+        // (used during drags — recreating markers mid-drag breaks Leaflet's
+        // drag tracking, so layers are moved, not rebuilt).
+        function updateSelectionVisuals(skipCorner) {
+            if (!sel || !currentBounds) return;
+            const f = boxFrame(currentBounds, currentRotation);
+            const corners = selectionCorners(f);
+            sel.poly.setLatLngs(corners);
+            sel.corners.forEach((m, i) => { if (i !== skipCorner) m.setLatLng(corners[i]); });
+            sel.rotHandle.setLatLng(rotHandleLatLng(f));
+            document.getElementById('rotationValue').textContent = `${Math.round(currentRotation)}°`;
+        }
+
+        // Full rebuild of the interactive selection layers.
+        function renderSelection() {
+            removeSelection();
+            if (!currentBounds) return;
+            const f = boxFrame(currentBounds, currentRotation);
+            const corners = selectionCorners(f);
+
+            const poly = L.polygon(corners, {
+                color: '#22c55e', weight: 2, fillOpacity: 0.1,
             }).addTo(map);
+
+            // --- drag to MOVE: track mouse deltas while dragging the polygon.
+            let moveStart = null;
+            poly.on('mousedown', (e) => {
+                L.DomEvent.stop(e.originalEvent);
+                map.dragging.disable();
+                moveStart = { lat: e.latlng.lat, lng: e.latlng.lng, b: { ...currentBounds } };
+                const onMove = (ev) => {
+                    if (!moveStart) return;
+                    const dLat = ev.latlng.lat - moveStart.lat;
+                    const dLon = ev.latlng.lng - moveStart.lng;
+                    let s = moveStart.b.south + dLat, n = moveStart.b.north + dLat;
+                    // Keep the box in Web-Mercator-sane latitudes.
+                    if (n > 85) { s -= n - 85; n = 85; }
+                    if (s < -85) { n += -85 - s; s = -85; }
+                    currentBounds = {
+                        south: s, north: n,
+                        west: moveStart.b.west + dLon, east: moveStart.b.east + dLon,
+                    };
+                    updateSelectionVisuals();
+                };
+                const onUp = () => {
+                    map.off('mousemove', onMove);
+                    // Document-level listener: fires even when the button is
+                    // released outside the map, so panning is always restored
+                    // and no move listener leaks.
+                    L.DomEvent.off(document, 'mouseup', onUp);
+                    map.dragging.enable();
+                    moveStart = null;
+                    panelRefresh();
+                };
+                map.on('mousemove', onMove);
+                L.DomEvent.on(document, 'mouseup', onUp);
+            });
+
+            // --- corner handles: RESIZE (opposite corner stays anchored).
+            const cornerMarkers = corners.map((ll, i) => {
+                const m = L.marker(ll, { draggable: true, icon: cornerIcon() }).addTo(map);
+                let anchor = null; // frame + opposite corner, frozen at dragstart
+                m.on('dragstart', () => {
+                    const f0 = boxFrame(currentBounds, currentRotation);
+                    anchor = { f: f0, opp: selectionCorners(f0)[(i + 2) % 4] };
+                });
+                m.on('drag', (ev) => {
+                    if (!anchor) return;
+                    const ll2 = ev.target.getLatLng();
+                    const { f, opp } = anchor;
+                    // Diagonal from anchored corner to cursor, in box axes.
+                    const de = (ll2.lng - opp[1]) * f.mLon, dn = (ll2.lat - opp[0]) * f.mLat;
+                    const du = de * f.c + dn * f.s, dv = de * f.s - dn * f.c;
+                    const wM = Math.max(MIN_SIZE_M, Math.abs(du));
+                    const hM = Math.max(MIN_SIZE_M, Math.abs(dv));
+                    // New center: offset from the ANCHORED corner by half the
+                    // (possibly min-size-clamped) box along the box axes, so
+                    // the anchor stays pinned even when the clamp engages.
+                    // (A raw diagonal midpoint would slide the anchor by up to
+                    // half the clamp when |du| or |dv| < MIN_SIZE_M.)
+                    const su = du >= 0 ? 1 : -1, sv = dv >= 0 ? 1 : -1;
+                    const ue = su * wM / 2, ve = sv * hM / 2;
+                    const ce = ue * f.c + ve * f.s, cn = ue * f.s - ve * f.c;
+                    const cLat2 = opp[0] + cn / f.mLat;
+                    const cLon2 = opp[1] + ce / f.mLon;
+                    currentBounds = {
+                        south: cLat2 - hM / 2 / f.mLat, north: cLat2 + hM / 2 / f.mLat,
+                        west: cLon2 - wM / 2 / f.mLon, east: cLon2 + wM / 2 / f.mLon,
+                    };
+                    updateSelectionVisuals(i);
+                });
+                m.on('dragend', () => { anchor = null; panelRefresh(); renderSelection(); });
+                return m;
+            });
+
+            // --- rotation handle: drag to ROTATE about the box center.
+            const rotHandle = L.marker(rotHandleLatLng(f), {
+                draggable: true, icon: rotIcon(),
+            }).addTo(map);
+            let rotAnchor = null;
+            rotHandle.on('dragstart', () => {
+                rotAnchor = boxFrame(currentBounds, currentRotation);
+            });
+            rotHandle.on('drag', (ev) => {
+                if (!rotAnchor) return;
+                const ll2 = ev.target.getLatLng();
+                const e = (ll2.lng - rotAnchor.cLon) * rotAnchor.mLon;
+                const n = (ll2.lat - rotAnchor.cLat) * rotAnchor.mLat;
+                // The handle lives on the box's -v axis, whose world direction
+                // is (-sin t, cos t): t = atan2(-e, n).
+                currentRotation = Math.round(Math.atan2(-e, n) * 180 / Math.PI);
+                updateSelectionVisuals();
+            });
+            rotHandle.on('dragend', () => { rotAnchor = null; panelRefresh(); renderSelection(); });
+
+            sel = { poly, corners: cornerMarkers, rotHandle };
         }
 
-        function setRotation(v) {
-            currentRotation = parseFloat(v) || 0;
-            document.getElementById('rotationValue').textContent = `${currentRotation}°`;
-            // Restyle the axis-aligned rect: it becomes a faint guide when the
-            // real (rotated) selection is shown by the orange polygon.
-            drawnItems.eachLayer((l) => l.setStyle && l.setStyle({
-                fillOpacity: currentRotation ? 0.02 : 0.1,
-                dashArray: currentRotation ? '6 6' : null,
-            }));
-            drawRotatedPreview();
+        function resetRotation() {
+            currentRotation = 0;
+            document.getElementById('rotationValue').textContent = '0°';
+            renderSelection();
+            panelRefresh();
         }
 
-        // DEM source / output size / detail-lock changed: re-clamp the current
-        // selection to the new detail limit and refresh the readouts.
-        function onDetailSettingsChange() {
-            if (currentBounds) {
-                applySelection(currentBounds);
-            } else {
-                updateAreaNotice();
-            }
+        // Set the selection to freshly drawn bounds and refresh everything.
+        // Resets rotation: the user just traced an axis-aligned rectangle, so
+        // inheriting the previous box's angle would silently snap the new
+        // selection to different ground than what they drew.
+        function setSelection(b) {
+            currentBounds = b;
+            currentRotation = 0;
+            panelRefresh();
+            renderSelection();
         }
 
         // Recompute the resolution readout (+ notices) for the current
@@ -1204,9 +1284,9 @@
         
         function clearSelection() {
             drawnItems.clearLayers();
+            removeSelection();
             currentBounds = null;
-            lastClampNote = '';
-            if (rotatedPreview) { map.removeLayer(rotatedPreview); rotatedPreview = null; }
+            currentRotation = 0;
             document.getElementById('noBoundsText').classList.remove('hidden');
             document.getElementById('boundsDisplay').classList.add('hidden');
             document.getElementById('clearBoundsBtn').classList.add('hidden');
@@ -1310,14 +1390,18 @@
             const label = {
                 COP30: 'Copernicus 30m', COP90: 'Copernicus 90m', SRTMGL1: 'SRTM 30m',
                 USGS1m: 'USGS 3DEP 1m LiDAR', USGS10m: 'USGS 3DEP 10m LiDAR',
-                GEBCOIceTopo: 'GEBCO'
+                USGS30m: 'USGS 3DEP 30m', GEBCOIceTopo: 'GEBCO'
             };
             const usedLabel = label[used] || used;
-            const isLidarReq = req === 'USGS1m' || req === 'USGS10m';
+            const isLidarReq = req === 'USGS1m' || req === 'USGS10m' || req === 'USGS30m';
             if (isLidarReq && used !== req) {
+                // The ladder falls back for several reasons (no coverage,
+                // account access, download too large, or the output resolution
+                // already saturated by a coarser source) — don't claim one.
                 return `<p class="progress-subtext" style="margin-top:0.75rem; font-size:0.8rem; color:#fbbf24;">
-                    ⚠️ No ${label[req] || req} coverage for this area — used <strong>${usedLabel}</strong> instead.
-                    Toggle the &ldquo;USGS LiDAR coverage (US)&rdquo; overlay to pick a covered area, or try USGS 10m.</p>`;
+                    ⚠️ ${label[req] || req} wasn't used for this map — it fell back to <strong>${usedLabel}</strong>
+                    (no coverage here, the area too large for that resolution, or account access).
+                    Check the &ldquo;USGS LiDAR coverage (US)&rdquo; overlay, or shrink the selection for finer detail.</p>`;
             }
             const emphasis = isLidarReq ? 'color:#4ade80;' : 'opacity:0.75;';
             return `<p class="progress-subtext" style="margin-top:0.75rem; font-size:0.8rem; ${emphasis}">
