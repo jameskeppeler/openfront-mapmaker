@@ -31,6 +31,13 @@ TYPE_WATER = 1
 # Deepest ocean depth (metres) mapped to the darkest water shade in depth.bin.
 # ~6000 m covers all but the deepest trenches; deeper water clamps to max.
 DEPTH_MAX_M = 6000.0
+# Land is elevation ABOVE this, not above exactly 0. Near-coastal water in
+# USGS 3DEP sits at 0 +/- a few centimetres (tidal datum vs NAVD88, project
+# seams), and different distributions of the same data tip those cells to
+# either side of zero — a strict >0 test renders that noise as blocky land
+# teeth and ghost bands along every shore. Sub-half-metre cells are tidal
+# flats / water surface, not playable land.
+SEA_LEVEL_EPS_M = 0.5
 
 # Use detailed OpenStreetMap water for selections up to this size (deg^2);
 # larger areas use Natural Earth (Overpass would be too heavy/slow). Raised
@@ -836,7 +843,7 @@ class MapProcessor:
         rgba = np.zeros((height, width, 4), dtype=np.uint8)
         rgba[:, :, 3] = 255
 
-        land = dem_array > 0
+        land = dem_array > SEA_LEVEL_EPS_M
         wc = DEM_COLOR_RAMP[0][1]
         rgba[~land, 0], rgba[~land, 1], rgba[~land, 2] = wc[0], wc[1], wc[2]
 
@@ -863,7 +870,7 @@ class MapProcessor:
         b = arr[:, :, 2].astype(int)
         a = arr[:, :, 3]
         water = (a < 20) | (b == 106)
-        land = (~water) & (dem_array > 0)
+        land = (~water) & (dem_array > SEA_LEVEL_EPS_M)
         if not np.any(land):
             return image
         land_colors = self._land_colors
