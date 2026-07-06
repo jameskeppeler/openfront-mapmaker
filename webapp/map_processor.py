@@ -307,21 +307,9 @@ class MapProcessor:
                 blend_dem, _, _ = self._load_dem(
                     blend_path, width_px, height_px, grid=grid, fill_nodata=True
                 )
-                # Noise gate: Copernicus GLO-30 is a radar SURFACE model with
-                # well-known small positive noise over near-shore water (waves,
-                # imperfect water masking). These cells are ones the land-only
-                # primary DEM explicitly declared NOT LAND, so a low blend
-                # value here is water noise, not a real 1-3m coastal strip —
-                # without the gate it renders as ghost land bands offset along
-                # every shoreline. Confident land (above the noise floor)
-                # fills as real terrain.
-                BLEND_NOISE_FLOOR_M = 3.0
-                blend_vals = np.where(
-                    blend_dem > BLEND_NOISE_FLOOR_M,
-                    blend_dem,
-                    np.minimum(blend_dem, 0.0),
+                dem_array = self._blend_nodata_regions(
+                    dem_array, nan_mask, blend_dem
                 )
-                dem_array = np.where(nan_mask, blend_vals, dem_array)
                 if os.path.exists(blend_path):
                     os.remove(blend_path)
             except Exception as e:
@@ -1657,6 +1645,52 @@ class MapProcessor:
         
         return generated_files
     
+    def _blend_nodata_regions(self, dem_array, nan_mask, blend_dem):
+        """Fill the primary DEM's nodata cells from a blend DEM, deciding
+        water vs missing-land PER CONNECTED NODATA REGION rather than per cell.
+
+        Copernicus GLO-30 (the usual blend) is a radar SURFACE model: over
+        near-shore water it carries both small noise (waves, water-mask
+        misses) and full 10-25m canopy/building heights where its coarse 30m
+        coastline disagrees with the primary DEM's — per-cell blending paints
+        those as blocky land teeth and ghost bands along every shore, and no
+        elevation floor can gate out canopy. Regions tell the truth: a nodata
+        region that is mostly water in the blend (a bay) IS water — including
+        its noisy fringe cells — while a region that is mostly land (a genuine
+        coverage void over land) is filled from the blend as real terrain.
+        """
+        BLEND_NOISE_FLOOR_M = 3.0
+        try:
+            from scipy.ndimage import label as nd_label
+        except ImportError:
+            # scipy unavailable: per-cell gate (coarser, but bounded).
+            blend_vals = np.where(
+                blend_dem > BLEND_NOISE_FLOOR_M,
+                blend_dem,
+                np.minimum(blend_dem, 0.0),
+            )
+            return np.where(nan_mask, blend_vals, dem_array)
+
+        regions, n_regions = nd_label(nan_mask)
+        blend_land = blend_dem > BLEND_NOISE_FLOOR_M
+        # Per-region land fraction via bincount (fast for many regions).
+        counts = np.bincount(regions.ravel())
+        land_counts = np.bincount(
+            regions.ravel(), weights=blend_land.ravel().astype(np.float64)
+        )
+        frac = np.zeros_like(land_counts)
+        nz = counts > 0
+        frac[nz] = land_counts[nz] / counts[nz]
+        fill_region = frac > 0.5   # region is mostly real land
+        fill_mask = nan_mask & fill_region[regions]
+        water_mask = nan_mask & ~fill_region[regions]
+        out = np.where(fill_mask, blend_dem, dem_array)
+        out = np.where(water_mask, np.minimum(blend_dem, 0.0), out)
+        print(f"Blend: {n_regions} nodata region(s); "
+              f"filled {int(fill_mask.sum())} cell(s) as land, "
+              f"{int(water_mask.sum())} as water")
+        return out
+
     def _space_out_spawns(self, points, width, height, min_frac=0.045):
         """De-cluster nation spawns so they aren't packed together.
 
