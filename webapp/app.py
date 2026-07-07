@@ -7,9 +7,10 @@ A web API for generating styled terrain maps from DEM data.
 import os
 import json
 import tempfile
+import threading
 import shutil
 from datetime import datetime
-from flask import Flask, request, jsonify, send_file, send_from_directory
+from flask import Flask, request, jsonify, send_file, send_from_directory, make_response
 from flask_cors import CORS
 from dotenv import load_dotenv
 from functools import wraps
@@ -35,6 +36,9 @@ SUPABASE_SERVICE_KEY = os.environ.get('SUPABASE_SERVICE_KEY', '')
 # Output directory for generated maps
 OUTPUT_DIR = os.path.join(tempfile.gettempdir(), 'openfront_maps')
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Serializes game-repo installs (Maps.gen.ts / en.json read-modify-write).
+_install_lock = threading.Lock()
 
 
 def require_auth(f):
@@ -64,8 +68,18 @@ def require_auth(f):
 
 @app.route('/')
 def index():
-    """Serve the main application page."""
-    return send_from_directory('static', 'index.html')
+    """Serve the main application page.
+
+    The page is served with no-cache headers so the browser always fetches the
+    latest UI. Without this, launching via the desktop shortcut (which opens a
+    tab in the existing browser) serves a stale cached index.html, so code
+    changes appear not to take effect until a manual hard-refresh.
+    """
+    resp = make_response(send_from_directory('static', 'index.html'))
+    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    return resp
 
 
 @app.route('/api/health')
@@ -108,6 +122,10 @@ def generate_map():
         dem_source = data.get('dem_source', 'COP90')
         width_px = data.get('width_px')
         height_px = data.get('height_px')
+        try:
+            rotation_deg = float(data.get('rotation_deg', 0) or 0)
+        except (TypeError, ValueError):
+            rotation_deg = 0.0
         
         if not bounds:
             return jsonify({'error': 'Bounds are required'}), 400
@@ -168,15 +186,19 @@ def generate_map():
             dem_source=dem_source,
             plains_frac=plains_frac,
             highland_frac=highland_frac,
+            rotation_deg=rotation_deg,
         )
         
         # Auto-install into the local OpenFront game (copy + register so it
         # shows in the in-game Custom tab). Non-fatal: if it fails, the user
-        # can still download the ZIP.
+        # can still download the ZIP. Serialized: install_map read-modify-
+        # writes Maps.gen.ts / en.json, and the server handles requests on
+        # multiple threads — concurrent installs could lose one map's entry.
         installed = None
         install_error = None
         try:
-            installed = install_map(map_dir, name)
+            with _install_lock:
+                installed = install_map(map_dir, name)
         except Exception as e:
             install_error = str(e)
 
@@ -187,6 +209,8 @@ def generate_map():
             'download_url': f'/api/download/{map_id}',
             'installed': installed,
             'install_error': install_error,
+            'dem_source_requested': result.get('dem_source_requested'),
+            'dem_source_used': result.get('dem_source_used'),
         })
         
     except Exception as e:
@@ -228,7 +252,14 @@ def download_file(map_id, filename):
 if __name__ == '__main__':
     # Default 5050: port 5000 is taken by AirPlay Receiver / Control Center on macOS.
     port = int(os.environ.get('PORT', 5050))
+    print(f"\n  OpenFront Map Maker running at:  http://localhost:{port}\n")
     # use_reloader=False: the auto-reloader can spawn an endless chain of
     # restarting processes on Windows (it relaunches with a different python
     # and never sets WERKZEUG_RUN_MAIN), leaving orphans stuck on the port.
-    app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False)
+    # threaded=True: the dev server is single-threaded by default, so one slow
+    # or hung generation (DEM downloads can take minutes) would block every
+    # other request — including serving the page — making the app look frozen
+    # until a restart. Threading lets the UI stay responsive and a failed
+    # generation be retried without restarting the server.
+    app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False,
+            threaded=True)
