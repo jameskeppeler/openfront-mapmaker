@@ -96,8 +96,15 @@ def install_map(output_dir, display_name, game_repo=None):
         shutil.copy2(src, os.path.join(dest, fn))
     for fn in OPTIONAL_GAME_FILES:
         src = os.path.join(output_dir, fn)
+        dst = os.path.join(dest, fn)
         if os.path.exists(src):
-            shutil.copy2(src, os.path.join(dest, fn))
+            shutil.copy2(src, dst)
+        elif os.path.exists(dst):
+            # Reinstalling over an older install: a stale optional file (e.g.
+            # depth.bin) would otherwise survive and — being the same size as
+            # the new map.bin — pass the game's alignment guard while showing
+            # depth for the PREVIOUS terrain.
+            os.remove(dst)
 
     # 2) Self-heal the manifest dimensions if needed.
     _repair_manifest_dims(dest)

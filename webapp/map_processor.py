@@ -7,8 +7,10 @@ Uses GDAL/Rasterio to replicate the QGIS map generation workflow.
 import os
 import json
 import math
+import threading
 import time
 import tempfile
+import uuid
 import requests
 import zipfile
 import numpy as np
@@ -546,9 +548,15 @@ class MapProcessor:
         print(f"Mosaicking {len(tiles)} DEM tile(s)...")
         merged_path = os.path.join(
             self.cache_dir,
-            f"dem_{dem_source}_{south}_{west}_{north}_{east}_merged.tif",
+            f"dem_{dem_source}_{uuid.uuid4().hex}_merged.tif",
         )
         self._merge_tiles(tiles, merged_path)
+        # The individual tiles fed the mosaic and are never reused.
+        for t in tiles:
+            try:
+                os.remove(t)
+            except OSError:
+                pass
         return merged_path
 
     def _download_dem_tiles(self, south: float, west: float, north: float,
@@ -558,12 +566,18 @@ class MapProcessor:
         Tries a single request; on an "area too large" rejection, subdivides
         into quadrants (up to MAX_TILE_DEPTH) and fetches each. A NoCoverageError
         propagates so the caller can fall back to a different source.
+
+        Tile files get unique (uuid) names: the server handles requests on
+        multiple threads, and bbox-derived names were never actually reused as
+        a cache (every call re-downloads) — shared names only meant two
+        concurrent generations of the same area could overwrite each other's
+        tile mid-read, or delete a file the other thread still needed.
         """
         content = self._request_dem(south, west, north, east, dem_source)
         if content is not None:
             tile_path = os.path.join(
                 self.cache_dir,
-                f"dem_{dem_source}_{south}_{west}_{north}_{east}.tif",
+                f"dem_{dem_source}_{uuid.uuid4().hex}.tif",
             )
             with open(tile_path, 'wb') as f:
                 f.write(content)
@@ -910,8 +924,13 @@ class MapProcessor:
                 if resp.status_code == 200:
                     data = resp.json()
                     try:
-                        with open(cache_file, "w", encoding="utf-8") as f:
+                        # Atomic write: the server handles requests on multiple
+                        # threads; a direct json.dump could leave a concurrent
+                        # reader a half-written file. os.replace is atomic.
+                        tmp = cache_file + f".{uuid.uuid4().hex}.tmp"
+                        with open(tmp, "w", encoding="utf-8") as f:
                             json.dump(data, f)
+                        os.replace(tmp, cache_file)
                     except Exception:
                         pass
                     return data
@@ -1103,42 +1122,49 @@ class MapProcessor:
 
         return image
     
+    # Serializes first-time Natural Earth downloads: the threaded server could
+    # otherwise have two requests extract the same zip into the same directory
+    # concurrently (partial shapefiles for one of them). Class-level so all
+    # MapProcessor instances (one per request) share it.
+    _ne_download_lock = threading.Lock()
+
     def _get_ne_shapefile(self, url: str, name: str) -> str:
         """Download and cache a Natural Earth shapefile."""
-        
+
         cache_dir = os.path.join(self.cache_dir, 'natural_earth', name)
-        
-        # Check if already cached
-        if os.path.exists(cache_dir):
-            for f in os.listdir(cache_dir):
-                if f.endswith('.shp'):
-                    return os.path.join(cache_dir, f)
-        
-        # Download
-        try:
-            os.makedirs(cache_dir, exist_ok=True)
-            print(f"Downloading {name} from Natural Earth...")
-            response = requests.get(url, timeout=120)
-            
-            if response.status_code == 200:
-                # Extract ZIP
-                zip_path = os.path.join(cache_dir, f'{name}.zip')
-                with open(zip_path, 'wb') as f:
-                    f.write(response.content)
-                
-                with zipfile.ZipFile(zip_path, 'r') as zf:
-                    zf.extractall(cache_dir)
-                
-                os.remove(zip_path)
-                
-                # Find .shp file
+
+        with MapProcessor._ne_download_lock:
+            # Check if already cached
+            if os.path.exists(cache_dir):
                 for f in os.listdir(cache_dir):
                     if f.endswith('.shp'):
                         return os.path.join(cache_dir, f)
-        
-        except Exception as e:
-            print(f"Warning: Could not download {name}: {e}")
-        
+
+            # Download
+            try:
+                os.makedirs(cache_dir, exist_ok=True)
+                print(f"Downloading {name} from Natural Earth...")
+                response = requests.get(url, timeout=120)
+
+                if response.status_code == 200:
+                    # Extract ZIP
+                    zip_path = os.path.join(cache_dir, f'{name}.zip')
+                    with open(zip_path, 'wb') as f:
+                        f.write(response.content)
+
+                    with zipfile.ZipFile(zip_path, 'r') as zf:
+                        zf.extractall(cache_dir)
+
+                    os.remove(zip_path)
+
+                    # Find .shp file
+                    for f in os.listdir(cache_dir):
+                        if f.endswith('.shp'):
+                            return os.path.join(cache_dir, f)
+
+            except Exception as e:
+                print(f"Warning: Could not download {name}: {e}")
+
         return None
     
     def _draw_polygons(self, draw, shp_path: str, south: float, west: float,

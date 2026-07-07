@@ -1274,11 +1274,22 @@
             // So: width = sqrt(MAX_PIXELS * aspect), height = sqrt(MAX_PIXELS / aspect)
             let width = Math.sqrt(MAX_PIXELS * aspect);
             let height = Math.sqrt(MAX_PIXELS / aspect);
-            
+
+            // Clamp each side: an extreme skinny rectangle would otherwise
+            // demand a texture beyond GPU limits on one axis (the game renders
+            // the map as a single texture) or a sub-8px side that breaks the
+            // backend's multiple-of-8 crop. The MP budget shifts to the other
+            // side where possible.
+            const MAX_SIDE = 8192, MIN_SIDE = 64;
+            if (width > MAX_SIDE) { width = MAX_SIDE; height = MAX_PIXELS / width; }
+            if (height > MAX_SIDE) { height = MAX_SIDE; width = MAX_PIXELS / height; }
+            width = Math.min(MAX_SIDE, Math.max(MIN_SIDE, width));
+            height = Math.min(MAX_SIDE, Math.max(MIN_SIDE, height));
+
             // Round to even numbers (required for downscaling)
             width = Math.floor(width / 2) * 2;
             height = Math.floor(height / 2) * 2;
-            
+
             return { width, height };
         }
         

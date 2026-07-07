@@ -7,6 +7,7 @@ A web API for generating styled terrain maps from DEM data.
 import os
 import json
 import tempfile
+import threading
 import shutil
 from datetime import datetime
 from flask import Flask, request, jsonify, send_file, send_from_directory, make_response
@@ -35,6 +36,9 @@ SUPABASE_SERVICE_KEY = os.environ.get('SUPABASE_SERVICE_KEY', '')
 # Output directory for generated maps
 OUTPUT_DIR = os.path.join(tempfile.gettempdir(), 'openfront_maps')
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Serializes game-repo installs (Maps.gen.ts / en.json read-modify-write).
+_install_lock = threading.Lock()
 
 
 def require_auth(f):
@@ -187,11 +191,14 @@ def generate_map():
         
         # Auto-install into the local OpenFront game (copy + register so it
         # shows in the in-game Custom tab). Non-fatal: if it fails, the user
-        # can still download the ZIP.
+        # can still download the ZIP. Serialized: install_map read-modify-
+        # writes Maps.gen.ts / en.json, and the server handles requests on
+        # multiple threads — concurrent installs could lose one map's entry.
         installed = None
         install_error = None
         try:
-            installed = install_map(map_dir, name)
+            with _install_lock:
+                installed = install_map(map_dir, name)
         except Exception as e:
             install_error = str(e)
 
